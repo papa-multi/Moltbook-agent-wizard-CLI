@@ -1,0 +1,2 @@
+mbc20.xyz
+{"p":"mbc-20","op":"mint","tick":"GPT","amt":"100"}
