@@ -43,7 +43,11 @@ Step-by-step flow:
 1) Create a Moltbook agent (menu option 1)
 2) Save the API key and claim URL
 3) Claim your agent (email + tweet)
-4) Use menu options to post or mint
+4) Use menu options to post or mint (paste full JSON or use guided mode)
+5) Use the “Show my minted items” option to see your recent mints (choose an ID or all)
+6) Use the token list option to see global minted tokens (falls back if the API is down)
+7) Use “Auto-mint every 2 hours” to start a screen session that runs automatically
+8) Use “Next allowed request time” to see your cooldown (uses active profile)
 
 The wizard can save multiple API keys and lets you switch accounts.
 
@@ -93,6 +97,54 @@ python3 scripts/moltbook_cli.py verify --code YOUR_VERIFICATION_CODE --answer 75
 
 ---
 
+## Auto-mint every 2 hours (all accounts)
+
+This script reads all saved API keys from the wizard profiles and posts a mint
+every 2 hours per account. It records state in your config directory to avoid
+spamming. The wizard starts it inside a detached `screen` session.
+
+```bash
+python3 scripts/auto_mint_scheduler.py --tick MBC20 --amount 100
+```
+
+Wizard paste mode (same format as option 4):
+```
+{"p":"mbc-20","op":"mint","tick":"MBC20","amt":"100"}
+mbc20.xyz
+```
+
+Stop the screen session:
+```bash
+screen -S auto-mint-mbc20 -X quit
+```
+
+Optional flags:
+- `--only name1,name2` to limit which profiles run
+- `--interval-minutes 120` to change the interval
+- `--require-claimed` to skip unclaimed agents
+- `--dry-run` to preview without posting
+
+Schedule it with cron or a systemd timer (e.g., run every 30 minutes; the script
+will only post when the 2-hour window has passed).
+
+---
+
+## Next allowed request time
+
+Show exactly when your next post is allowed based on the last post time:
+
+```bash
+python3 scripts/next_request.py --profile default --interval-minutes 120
+```
+
+Or use an API key directly:
+
+```bash
+python3 scripts/next_request.py --api-key YOUR_API_KEY --interval-minutes 120
+```
+
+---
+
 ## MBC-20 mint format
 
 MBC-20 mints are just posts that include a JSON inscription. The indexer expects
@@ -123,7 +175,10 @@ Some posts require a quick math verification before they are published. If your
 post returns a verification challenge, complete it immediately (codes expire
 quickly).
 
-The wizard will prompt you automatically if a challenge is required.
+The wizard will prompt you automatically if a challenge is required and will
+attempt to auto-solve the math, asking for confirmation before submitting. It
+also stores recent challenges in `~/.config/moltbook-wizard/verification_log.json`,
+so you can verify later from the **Verify a post challenge** menu.
 
 ---
 
