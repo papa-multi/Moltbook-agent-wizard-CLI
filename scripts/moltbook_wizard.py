@@ -28,6 +28,7 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model
 DEFAULT_OPENROUTER_MODEL = "openrouter/auto"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+LOCAL_ONLY_VERIFICATION = True
 LLM_PROVIDERS = ("openrouter", "openai", "gemini")
 
 _SMALL_NUMBERS = {
@@ -126,6 +127,15 @@ _DIVIDE_HINTS = {
     "divided",
     "over",
     "quotient",
+}
+_RATE_UNITS = {
+    "per second",
+    "per minute",
+    "per hour",
+    "per day",
+    "per week",
+    "per month",
+    "per year",
 }
 
 
@@ -357,13 +367,83 @@ def _clean_challenge_for_llm(challenge):
     text = challenge.lower()
     text = re.sub(r"([a-z])[^a-z0-9\s]+([a-z])", r"\1\2", text)
     text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    tokens = _merge_numeric_fragments(text.split())
     parts = []
-    for token in text.split():
+    for token in tokens:
         if token.isalpha():
-            parts.append(_normalize_word(token))
+            parts.append(_normalize_number_token(token))
         else:
             parts.append(token)
     return " ".join(parts)
+
+
+def _merge_numeric_fragments(tokens):
+    merged = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token.isalpha():
+            norm = _normalize_word(token)
+            if i + 2 < len(tokens) and tokens[i + 1].isalpha() and tokens[i + 2].isalpha():
+                next_norm = _normalize_word(tokens[i + 1])
+                third_norm = _normalize_word(tokens[i + 2])
+                combined = _fix_number_word(norm + next_norm + third_norm)
+                if combined in _NUMBER_WORDS or combined in _SCALE_NUMBERS or combined == "and":
+                    merged.append(combined)
+                    i += 3
+                    continue
+            if i + 1 < len(tokens) and tokens[i + 1].isalpha():
+                next_norm = _normalize_word(tokens[i + 1])
+                combined = _fix_number_word(norm + next_norm)
+                if combined in _NUMBER_WORDS or combined in _SCALE_NUMBERS or combined == "and":
+                    merged.append(combined)
+                    i += 2
+                    continue
+            merged.append(_fix_number_word(norm))
+        else:
+            merged.append(token)
+        i += 1
+    return merged
+
+def _prepare_hint_text(challenge):
+    cleaned = _clean_challenge_for_llm(challenge).lower()
+    compact = re.sub(r"[^a-z]+", "", cleaned)
+    compact_norm = _normalize_word(compact)
+    return cleaned, compact, compact_norm
+
+
+def _has_hint(hints, cleaned, compact, compact_norm):
+    for hint in hints:
+        if hint in cleaned:
+            return True
+        if hint.replace(" ", "") in compact:
+            return True
+        if hint.replace(" ", "") in compact_norm:
+            return True
+    return False
+
+
+def _should_multiply_each(cleaned, compact, compact_norm):
+    if not cleaned:
+        return False
+    if "each" not in cleaned and "per" not in cleaned:
+        return False
+    for unit in _RATE_UNITS:
+        if unit in cleaned or unit.replace(" ", "") in compact or unit.replace(" ", "") in compact_norm:
+            return False
+    return any(
+        phrase in cleaned or phrase.replace(" ", "") in compact or phrase.replace(" ", "") in compact_norm
+        for phrase in (
+            "there are",
+            "there is",
+            "number of",
+            "how many",
+            "total of",
+            "in total",
+            "overall",
+            "altogether",
+        )
+    )
 
 
 def _extract_message_content(message):
@@ -783,8 +863,23 @@ def _normalize_number_token(token):
         return token
     if token.isalpha():
         token = _normalize_word(token)
+        token = _fix_number_word(token)
         if token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and":
             return token
+    return token
+
+
+def _fix_number_word(token):
+    if token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and":
+        return token
+    if len(token) >= 4:
+        candidates = [
+            word
+            for word in (_NUMBER_WORDS | set(_SCALE_NUMBERS))
+            if word.startswith(token) and len(word) == len(token) + 1
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
     return token
 
 
@@ -805,15 +900,17 @@ def _build_llm_expression(challenge):
             return expr
         except Exception:
             pass
-    challenge_lower = (challenge or "").lower()
+    cleaned, compact, compact_norm = _prepare_hint_text(challenge)
     op = None
-    if numbers and any(hint in challenge_lower for hint in _SUM_HINTS):
-        op = "+"
-    elif len(numbers) >= 2 and any(hint in challenge_lower for hint in _SUBTRACT_HINTS):
-        op = "-"
-    elif len(numbers) >= 2 and any(hint in challenge_lower for hint in _MULTIPLY_HINTS):
+    if len(numbers) >= 2 and _should_multiply_each(cleaned, compact, compact_norm):
         op = "*"
-    elif len(numbers) >= 2 and any(hint in challenge_lower for hint in _DIVIDE_HINTS):
+    elif numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
+        op = "+"
+    elif len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
+        op = "-"
+    elif len(numbers) >= 2 and _has_hint(_MULTIPLY_HINTS, cleaned, compact, compact_norm):
+        op = "*"
+    elif len(numbers) >= 2 and _has_hint(_DIVIDE_HINTS, cleaned, compact, compact_norm):
         op = "/"
     if numbers:
         formatted = [_format_expr_number(n) for n in numbers]
@@ -876,7 +973,7 @@ def _challenge_to_expr(challenge):
     text = re.sub(r"(?<=[a-z])[+*/-]+", " ", text)
     text = re.sub(r"[+*/-]+(?=[a-z])", " ", text)
     text = text.replace("-", " ")
-    tokens = re.findall(r"[a-z]+|\d+(?:\.\d+)?|[+*/()\-]", text)
+    tokens = _merge_numeric_fragments(re.findall(r"[a-z]+|\d+(?:\.\d+)?|[+*/()\-]", text))
     out = []
     numbers = []
     has_operator = False
@@ -907,7 +1004,7 @@ def _challenge_to_expr(challenge):
             while j < len(tokens):
                 nxt = tokens[j]
                 if nxt.isalpha():
-                    nxt = _normalize_word(nxt)
+                    nxt = _normalize_number_token(nxt)
                 if nxt in _NUMBER_WORDS or nxt in _SCALE_NUMBERS or nxt == "and":
                     words.append(nxt)
                     j += 1
@@ -983,21 +1080,30 @@ def _solve_local_math(challenge):
             return f"{result:.2f}"
         except Exception:
             pass
-    challenge_lower = (challenge or "").lower()
-    if numbers and any(hint in challenge_lower for hint in _SUM_HINTS):
-        return f"{sum(numbers):.2f}"
-    if len(numbers) >= 2 and any(hint in challenge_lower for hint in _SUBTRACT_HINTS):
-        return f"{numbers[0] - numbers[1]:.2f}"
-    if len(numbers) >= 2 and any(hint in challenge_lower for hint in _MULTIPLY_HINTS):
+    cleaned, compact, compact_norm = _prepare_hint_text(challenge)
+    if len(numbers) >= 2 and _should_multiply_each(cleaned, compact, compact_norm):
         return f"{numbers[0] * numbers[1]:.2f}"
-    if len(numbers) >= 2 and any(hint in challenge_lower for hint in _DIVIDE_HINTS):
+    if numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
+        return f"{sum(numbers):.2f}"
+    if len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
+        return f"{numbers[0] - numbers[1]:.2f}"
+    if len(numbers) >= 2 and _has_hint(_MULTIPLY_HINTS, cleaned, compact, compact_norm):
+        return f"{numbers[0] * numbers[1]:.2f}"
+    if len(numbers) >= 2 and _has_hint(_DIVIDE_HINTS, cleaned, compact, compact_norm):
         if numbers[1] == 0:
             return None
         return f"{numbers[0] / numbers[1]:.2f}"
+    if len(numbers) >= 2 and not has_operator:
+        return f"{sum(numbers):.2f}"
     return None
 
 
 def _solve_math_challenge(challenge):
+    local_answer = _solve_local_math(challenge)
+    if LOCAL_ONLY_VERIFICATION:
+        if local_answer:
+            return local_answer, None
+        return None, "local solver failed"
     solvers = {
         "openrouter": _solve_with_openrouter,
         "openai": _solve_with_openai,
