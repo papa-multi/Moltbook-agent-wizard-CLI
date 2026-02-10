@@ -351,6 +351,21 @@ def _format_answer(value):
         return value
 
 
+def _clean_challenge_for_llm(challenge):
+    if not challenge:
+        return ""
+    text = challenge.lower()
+    text = re.sub(r"([a-z])[^a-z0-9\s]+([a-z])", r"\1\2", text)
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    parts = []
+    for token in text.split():
+        if token.isalpha():
+            parts.append(_normalize_word(token))
+        else:
+            parts.append(token)
+    return " ".join(parts)
+
+
 def _extract_message_content(message):
     if not isinstance(message, dict):
         return ""
@@ -374,9 +389,10 @@ def _build_math_prompt(challenge):
     expr = _build_llm_expression(challenge)
     if expr:
         return f"Calculate: {expr}. Return only the number with exactly two decimal places."
+    cleaned = _clean_challenge_for_llm(challenge)
     return (
         "Calculate the result and return only the number with exactly two decimal places: "
-        f"{challenge}"
+        f"{cleaned or challenge}"
     )
 
 
@@ -762,6 +778,16 @@ def _collapse_duplicate_number_words(words):
     return collapsed
 
 
+def _normalize_number_token(token):
+    if not token:
+        return token
+    if token.isalpha():
+        token = _normalize_word(token)
+        if token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and":
+            return token
+    return token
+
+
 def _format_expr_number(value):
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
@@ -824,7 +850,7 @@ def _is_number_token(token):
     if re.match(r"\d", token or ""):
         return True
     if token and token.isalpha():
-        token = _normalize_word(token)
+        token = _normalize_number_token(token)
         return token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and"
     return False
 
@@ -845,7 +871,11 @@ def _has_number_ahead(tokens, start):
 def _challenge_to_expr(challenge):
     if not challenge:
         return "", [], False
-    text = challenge.lower().replace("-", " ")
+    text = challenge.lower()
+    text = re.sub(r"([a-z])[^a-z0-9\s]+([a-z])", r"\1\2", text)
+    text = re.sub(r"(?<=[a-z])[+*/-]+", " ", text)
+    text = re.sub(r"[+*/-]+(?=[a-z])", " ", text)
+    text = text.replace("-", " ")
     tokens = re.findall(r"[a-z]+|\d+(?:\.\d+)?|[+*/()\-]", text)
     out = []
     numbers = []
@@ -870,7 +900,7 @@ def _challenge_to_expr(challenge):
             i += 1
             continue
         if token.isalpha():
-            token = _normalize_word(token)
+            token = _normalize_number_token(token)
         if token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and":
             words = []
             j = i
@@ -884,10 +914,12 @@ def _challenge_to_expr(challenge):
                     continue
                 break
             words = _collapse_duplicate_number_words(words)
-            value = _words_to_number(words)
-            out.append(str(value))
-            numbers.append(float(value))
-            prev_number = True
+            has_numeric = any(word in _SMALL_NUMBERS or word in _TENS_NUMBERS or word in _SCALE_NUMBERS for word in words)
+            if has_numeric:
+                value = _words_to_number(words)
+                out.append(str(value))
+                numbers.append(float(value))
+                prev_number = True
             i = j
             continue
         if token in "+-*/()":
