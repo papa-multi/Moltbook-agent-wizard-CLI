@@ -114,6 +114,10 @@ _MULTIPLY_HINTS = {
     "times",
     "multiplied",
     "multiply",
+    "multiplies",
+    "multiplier",
+    "multipliers",
+    "multiplication",
 }
 _DIVIDE_HINTS = {
     "divide",
@@ -130,6 +134,40 @@ _RATE_UNITS = {
     "per month",
     "per year",
 }
+_TIME_UNITS = {
+    "second",
+    "seconds",
+    "minute",
+    "minutes",
+    "hour",
+    "hours",
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+}
+_DURATION_HINTS = {"for", "during", "over", "in", "travel", "traveled", "travelled", "distance", "moved"}
+_COUNT_REPEAT_HINTS = {
+    "touches",
+    "hits",
+    "strikes",
+    "times",
+    "repeats",
+    "repetitions",
+    "occurrences",
+    "instances",
+}
+_COUNT_ENTITY_HINTS = {
+    "claws",
+    "lobsters",
+    "people",
+}
+_COUNT_HINTS = _COUNT_REPEAT_HINTS | _COUNT_ENTITY_HINTS
+_COUNT_VERBS = {"are", "is", "were", "was"}
 
 
 def _utc_now():
@@ -285,21 +323,20 @@ def _merge_numeric_fragments(tokens):
         token = tokens[i]
         if token.isalpha():
             norm = _normalize_word(token)
-            if i + 2 < len(tokens) and tokens[i + 1].isalpha() and tokens[i + 2].isalpha():
-                next_norm = _normalize_word(tokens[i + 1])
-                third_norm = _normalize_word(tokens[i + 2])
-                combined = _fix_number_word(norm + next_norm + third_norm)
+            matched = False
+            max_span = min(6, len(tokens) - i)
+            for span in range(max_span, 1, -1):
+                if not all(tokens[i + j].isalpha() for j in range(span)):
+                    continue
+                combined = "".join(_normalize_word(tokens[i + j]) for j in range(span))
+                combined = _fix_number_word(combined)
                 if combined in _NUMBER_WORDS or combined in _SCALE_NUMBERS or combined == "and":
                     merged.append(combined)
-                    i += 3
-                    continue
-            if i + 1 < len(tokens) and tokens[i + 1].isalpha():
-                next_norm = _normalize_word(tokens[i + 1])
-                combined = _fix_number_word(norm + next_norm)
-                if combined in _NUMBER_WORDS or combined in _SCALE_NUMBERS or combined == "and":
-                    merged.append(combined)
-                    i += 2
-                    continue
+                    i += span
+                    matched = True
+                    break
+            if matched:
+                continue
             merged.append(_fix_number_word(norm))
         else:
             merged.append(token)
@@ -321,6 +358,54 @@ def _has_hint(hints, cleaned, compact, compact_norm):
             return True
         if hint.replace(" ", "") in compact_norm:
             return True
+    return False
+
+
+def _has_word(cleaned, word):
+    return bool(re.search(rf"\b{re.escape(word)}\b", cleaned))
+
+
+def _has_any_word(cleaned, words):
+    return any(_has_word(cleaned, word) for word in words)
+
+
+def _has_duration_hint(cleaned, compact, compact_norm):
+    if _has_any_word(cleaned, _DURATION_HINTS):
+        return True
+    if not compact:
+        return False
+    for hint in _DURATION_HINTS:
+        for unit in _TIME_UNITS:
+            combo = f"{hint}{unit}"
+            if combo in compact or combo in compact_norm:
+                return True
+    return False
+
+
+def _should_multiply_rate(cleaned, compact, compact_norm):
+    if not cleaned:
+        return False
+    if not _has_hint(_RATE_UNITS, cleaned, compact, compact_norm):
+        return False
+    if not _has_hint(_TIME_UNITS, cleaned, compact, compact_norm):
+        return False
+    return _has_duration_hint(cleaned, compact, compact_norm)
+
+
+def _should_multiply_count(cleaned, compact, compact_norm, numbers):
+    if not cleaned or len(numbers) != 2:
+        return False
+    has_repeat = _has_hint(_COUNT_REPEAT_HINTS, cleaned, compact, compact_norm)
+    has_entity = _has_hint(_COUNT_ENTITY_HINTS, cleaned, compact, compact_norm)
+    if not (has_repeat or has_entity):
+        return False
+    if has_repeat:
+        if _has_any_word(cleaned, _COUNT_VERBS) or _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
+            return True
+    if has_entity:
+        for phrase in ("there are", "there is", "number of", "count of", "total of", "in total"):
+            if phrase in cleaned or phrase.replace(" ", "") in compact or phrase.replace(" ", "") in compact_norm:
+                return True
     return False
 
 
@@ -582,7 +667,20 @@ def _fix_number_word(token):
         ]
         if len(candidates) == 1:
             return candidates[0]
+        if 4 <= len(token) <= 6:
+            for word in (_NUMBER_WORDS | set(_SCALE_NUMBERS)):
+                if len(word) == len(token) + 1 and word[0] == token[0]:
+                    if _is_subsequence(token, word):
+                        return word
     return token
+
+
+def _is_subsequence(shorter, longer):
+    idx = 0
+    for ch in longer:
+        if idx < len(shorter) and shorter[idx] == ch:
+            idx += 1
+    return idx == len(shorter)
 
 
 def _format_number(value):
@@ -604,16 +702,20 @@ def _build_llm_expression(challenge):
             pass
     cleaned, compact, compact_norm = _prepare_hint_text(challenge)
     op = None
-    if len(numbers) >= 2 and _should_multiply_each(cleaned, compact, compact_norm):
+    if len(numbers) >= 2 and _should_multiply_rate(cleaned, compact, compact_norm):
         op = "*"
-    elif numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
-        op = "+"
-    elif len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
-        op = "-"
+    elif _should_multiply_count(cleaned, compact, compact_norm, numbers):
+        op = "*"
+    elif len(numbers) >= 2 and _should_multiply_each(cleaned, compact, compact_norm):
+        op = "*"
     elif len(numbers) >= 2 and _has_hint(_MULTIPLY_HINTS, cleaned, compact, compact_norm):
         op = "*"
     elif len(numbers) >= 2 and _has_hint(_DIVIDE_HINTS, cleaned, compact, compact_norm):
         op = "/"
+    elif len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
+        op = "-"
+    elif numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
+        op = "+"
     if numbers:
         formatted = [_format_number(n) for n in numbers]
         if op == "+":
@@ -783,18 +885,22 @@ def _solve_local_math(challenge):
         except Exception:
             pass
     cleaned, compact, compact_norm = _prepare_hint_text(challenge)
+    if len(numbers) >= 2 and _should_multiply_rate(cleaned, compact, compact_norm):
+        return f"{numbers[0] * numbers[1]:.2f}"
+    if _should_multiply_count(cleaned, compact, compact_norm, numbers):
+        return f"{numbers[0] * numbers[1]:.2f}"
     if len(numbers) >= 2 and _should_multiply_each(cleaned, compact, compact_norm):
         return f"{numbers[0] * numbers[1]:.2f}"
-    if numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
-        return f"{sum(numbers):.2f}"
-    if len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
-        return f"{numbers[0] - numbers[1]:.2f}"
     if len(numbers) >= 2 and _has_hint(_MULTIPLY_HINTS, cleaned, compact, compact_norm):
         return f"{numbers[0] * numbers[1]:.2f}"
     if len(numbers) >= 2 and _has_hint(_DIVIDE_HINTS, cleaned, compact, compact_norm):
         if numbers[1] == 0:
             return None
         return f"{numbers[0] / numbers[1]:.2f}"
+    if len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
+        return f"{numbers[0] - numbers[1]:.2f}"
+    if numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
+        return f"{sum(numbers):.2f}"
     if len(numbers) >= 2 and not has_operator:
         return f"{sum(numbers):.2f}"
     return None
@@ -1095,9 +1201,14 @@ def _parse_suspension_until(error_text):
 def _post_mint(base_url, api_key, tick, amount, submolt, prefix, dry_run):
     payload = {"p": "mbc-20", "op": "mint", "tick": tick, "amt": str(amount)}
     payload_str = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
-    content = f"{prefix}\n{payload_str}" if prefix else payload_str
     timestamp = _utc_now().strftime("%Y-%m-%d %H:%M:%S")
     title = f"mint task {timestamp}"
+    content_lines = []
+    if prefix:
+        content_lines.append(prefix)
+    content_lines.append(f"mint task {timestamp}")
+    content_lines.append(payload_str)
+    content = "\n".join(content_lines)
     body = {"submolt": submolt, "title": title, "content": content}
     if dry_run:
         return {"success": True, "dry_run": True, "body": body}, None

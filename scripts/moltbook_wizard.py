@@ -121,6 +121,10 @@ _MULTIPLY_HINTS = {
     "times",
     "multiplied",
     "multiply",
+    "multiplies",
+    "multiplier",
+    "multipliers",
+    "multiplication",
 }
 _DIVIDE_HINTS = {
     "divide",
@@ -137,6 +141,40 @@ _RATE_UNITS = {
     "per month",
     "per year",
 }
+_TIME_UNITS = {
+    "second",
+    "seconds",
+    "minute",
+    "minutes",
+    "hour",
+    "hours",
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+}
+_DURATION_HINTS = {"for", "during", "over", "in", "travel", "traveled", "travelled", "distance", "moved"}
+_COUNT_REPEAT_HINTS = {
+    "touches",
+    "hits",
+    "strikes",
+    "times",
+    "repeats",
+    "repetitions",
+    "occurrences",
+    "instances",
+}
+_COUNT_ENTITY_HINTS = {
+    "claws",
+    "lobsters",
+    "people",
+}
+_COUNT_HINTS = _COUNT_REPEAT_HINTS | _COUNT_ENTITY_HINTS
+_COUNT_VERBS = {"are", "is", "were", "was"}
 
 
 class ExitWizard(Exception):
@@ -384,21 +422,20 @@ def _merge_numeric_fragments(tokens):
         token = tokens[i]
         if token.isalpha():
             norm = _normalize_word(token)
-            if i + 2 < len(tokens) and tokens[i + 1].isalpha() and tokens[i + 2].isalpha():
-                next_norm = _normalize_word(tokens[i + 1])
-                third_norm = _normalize_word(tokens[i + 2])
-                combined = _fix_number_word(norm + next_norm + third_norm)
+            matched = False
+            max_span = min(6, len(tokens) - i)
+            for span in range(max_span, 1, -1):
+                if not all(tokens[i + j].isalpha() for j in range(span)):
+                    continue
+                combined = "".join(_normalize_word(tokens[i + j]) for j in range(span))
+                combined = _fix_number_word(combined)
                 if combined in _NUMBER_WORDS or combined in _SCALE_NUMBERS or combined == "and":
                     merged.append(combined)
-                    i += 3
-                    continue
-            if i + 1 < len(tokens) and tokens[i + 1].isalpha():
-                next_norm = _normalize_word(tokens[i + 1])
-                combined = _fix_number_word(norm + next_norm)
-                if combined in _NUMBER_WORDS or combined in _SCALE_NUMBERS or combined == "and":
-                    merged.append(combined)
-                    i += 2
-                    continue
+                    i += span
+                    matched = True
+                    break
+            if matched:
+                continue
             merged.append(_fix_number_word(norm))
         else:
             merged.append(token)
@@ -420,6 +457,54 @@ def _has_hint(hints, cleaned, compact, compact_norm):
             return True
         if hint.replace(" ", "") in compact_norm:
             return True
+    return False
+
+
+def _has_word(cleaned, word):
+    return bool(re.search(rf"\b{re.escape(word)}\b", cleaned))
+
+
+def _has_any_word(cleaned, words):
+    return any(_has_word(cleaned, word) for word in words)
+
+
+def _has_duration_hint(cleaned, compact, compact_norm):
+    if _has_any_word(cleaned, _DURATION_HINTS):
+        return True
+    if not compact:
+        return False
+    for hint in _DURATION_HINTS:
+        for unit in _TIME_UNITS:
+            combo = f"{hint}{unit}"
+            if combo in compact or combo in compact_norm:
+                return True
+    return False
+
+
+def _should_multiply_rate(cleaned, compact, compact_norm):
+    if not cleaned:
+        return False
+    if not _has_hint(_RATE_UNITS, cleaned, compact, compact_norm):
+        return False
+    if not _has_hint(_TIME_UNITS, cleaned, compact, compact_norm):
+        return False
+    return _has_duration_hint(cleaned, compact, compact_norm)
+
+
+def _should_multiply_count(cleaned, compact, compact_norm, numbers):
+    if not cleaned or len(numbers) != 2:
+        return False
+    has_repeat = _has_hint(_COUNT_REPEAT_HINTS, cleaned, compact, compact_norm)
+    has_entity = _has_hint(_COUNT_ENTITY_HINTS, cleaned, compact, compact_norm)
+    if not (has_repeat or has_entity):
+        return False
+    if has_repeat:
+        if _has_any_word(cleaned, _COUNT_VERBS) or _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
+            return True
+    if has_entity:
+        for phrase in ("there are", "there is", "number of", "count of", "total of", "in total"):
+            if phrase in cleaned or phrase.replace(" ", "") in compact or phrase.replace(" ", "") in compact_norm:
+                return True
     return False
 
 
@@ -880,7 +965,20 @@ def _fix_number_word(token):
         ]
         if len(candidates) == 1:
             return candidates[0]
+        if 4 <= len(token) <= 6:
+            for word in (_NUMBER_WORDS | set(_SCALE_NUMBERS)):
+                if len(word) == len(token) + 1 and word[0] == token[0]:
+                    if _is_subsequence(token, word):
+                        return word
     return token
+
+
+def _is_subsequence(shorter, longer):
+    idx = 0
+    for ch in longer:
+        if idx < len(shorter) and shorter[idx] == ch:
+            idx += 1
+    return idx == len(shorter)
 
 
 def _format_expr_number(value):
@@ -902,16 +1000,20 @@ def _build_llm_expression(challenge):
             pass
     cleaned, compact, compact_norm = _prepare_hint_text(challenge)
     op = None
-    if len(numbers) >= 2 and _should_multiply_each(cleaned, compact, compact_norm):
+    if len(numbers) >= 2 and _should_multiply_rate(cleaned, compact, compact_norm):
         op = "*"
-    elif numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
-        op = "+"
-    elif len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
-        op = "-"
+    elif _should_multiply_count(cleaned, compact, compact_norm, numbers):
+        op = "*"
+    elif len(numbers) >= 2 and _should_multiply_each(cleaned, compact, compact_norm):
+        op = "*"
     elif len(numbers) >= 2 and _has_hint(_MULTIPLY_HINTS, cleaned, compact, compact_norm):
         op = "*"
     elif len(numbers) >= 2 and _has_hint(_DIVIDE_HINTS, cleaned, compact, compact_norm):
         op = "/"
+    elif len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
+        op = "-"
+    elif numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
+        op = "+"
     if numbers:
         formatted = [_format_expr_number(n) for n in numbers]
         if op == "+":
@@ -1081,18 +1183,22 @@ def _solve_local_math(challenge):
         except Exception:
             pass
     cleaned, compact, compact_norm = _prepare_hint_text(challenge)
+    if len(numbers) >= 2 and _should_multiply_rate(cleaned, compact, compact_norm):
+        return f"{numbers[0] * numbers[1]:.2f}"
+    if _should_multiply_count(cleaned, compact, compact_norm, numbers):
+        return f"{numbers[0] * numbers[1]:.2f}"
     if len(numbers) >= 2 and _should_multiply_each(cleaned, compact, compact_norm):
         return f"{numbers[0] * numbers[1]:.2f}"
-    if numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
-        return f"{sum(numbers):.2f}"
-    if len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
-        return f"{numbers[0] - numbers[1]:.2f}"
     if len(numbers) >= 2 and _has_hint(_MULTIPLY_HINTS, cleaned, compact, compact_norm):
         return f"{numbers[0] * numbers[1]:.2f}"
     if len(numbers) >= 2 and _has_hint(_DIVIDE_HINTS, cleaned, compact, compact_norm):
         if numbers[1] == 0:
             return None
         return f"{numbers[0] / numbers[1]:.2f}"
+    if len(numbers) >= 2 and _has_hint(_SUBTRACT_HINTS, cleaned, compact, compact_norm):
+        return f"{numbers[0] - numbers[1]:.2f}"
+    if numbers and _has_hint(_SUM_HINTS, cleaned, compact, compact_norm):
+        return f"{sum(numbers):.2f}"
     if len(numbers) >= 2 and not has_operator:
         return f"{sum(numbers):.2f}"
     return None
@@ -1509,21 +1615,67 @@ def _parse_mbc20_mint(content):
 
 
 def _cmd_my_mints(base_url, state):
-    _print_header("Your MBC-20 mints (recent)")
-    api_key = _get_api_key(state)
-    me = _request("GET", f"{base_url}/agents/me", api_key=api_key)
-    if not me:
+    _print_header("MBC-20 mints (recent)")
+    profiles_data = _load_profiles()
+    profiles_map = profiles_data.get("profiles", {})
+    active = profiles_data.get("active")
+    selected_profiles = []
+    if profiles_map:
+        if len(profiles_map) > 1:
+            choice = _prompt("Show mints for (all/active/choose)", default="all", required=False)
+            choice = (choice or "all").strip().lower()
+            if choice in ("active", "a"):
+                if active and active in profiles_map:
+                    selected_profiles = [active]
+                else:
+                    selected = _choose_profile_name(profiles_map)
+                    if selected:
+                        selected_profiles = [selected]
+            elif choice in ("choose", "c"):
+                selected = _choose_profile_name(profiles_map)
+                if selected:
+                    selected_profiles = [selected]
+            else:
+                selected_profiles = sorted(profiles_map.keys())
+        else:
+            selected_profiles = [next(iter(profiles_map.keys()))]
+    else:
+        api_key = _get_api_key(state)
+        selected_profiles = [state.get("profile_name") or "default"]
+        profiles_map = {selected_profiles[0]: {"api_key": api_key}}
+
+    if not selected_profiles:
+        print("No profiles selected.")
         return
-    agent = me.get("agent", me)
-    agent_name = agent.get("name")
-    if not agent_name:
-        print("Unable to determine agent name.")
+
+    agent_names = {}
+    request_key = None
+    for profile_name in selected_profiles:
+        api_key = (profiles_map.get(profile_name) or {}).get("api_key")
+        if not api_key:
+            print(f"[{profile_name}] missing API key, skipping.")
+            continue
+        me = _request("GET", f"{base_url}/agents/me", api_key=api_key)
+        if not me:
+            print(f"[{profile_name}] unable to fetch agent profile, skipping.")
+            continue
+        agent = me.get("agent", me)
+        agent_name = agent.get("name")
+        if not agent_name:
+            print(f"[{profile_name}] missing agent name, skipping.")
+            continue
+        agent_names[agent_name] = profile_name
+        if not request_key:
+            request_key = api_key
+
+    if not agent_names:
+        print("No valid agent profiles found.")
         return
 
     posts_data = _request(
         "GET",
         f"{base_url}/posts?submolt=mbc20&sort=new&limit=100",
-        api_key=api_key,
+        api_key=request_key,
     )
     if not posts_data:
         return
@@ -1535,7 +1687,8 @@ def _cmd_my_mints(base_url, state):
     results = []
     for post in posts:
         author = post.get("author", {}) or {}
-        if author.get("name") != agent_name:
+        author_name = author.get("name")
+        if author_name not in agent_names:
             continue
         mint_info = _parse_mbc20_mint(post.get("content", ""))
         if not mint_info:
@@ -1545,6 +1698,8 @@ def _cmd_my_mints(base_url, state):
             url = f"https://www.moltbook.com{url}"
         results.append(
             {
+                "agent": author_name,
+                "profile": agent_names.get(author_name),
                 "tick": mint_info.get("tick"),
                 "amt": mint_info.get("amt"),
                 "created_at": post.get("created_at"),
@@ -1555,17 +1710,20 @@ def _cmd_my_mints(base_url, state):
         )
 
     if not results:
-        print("No mint posts found in the last 100 MBC-20 posts.")
+        names = ", ".join(sorted(agent_names.keys()))
+        print(f"No mint posts found in the last 100 MBC-20 posts for: {names}")
         print("Tip: if you minted earlier, try again later or use the mbc20.xyz agent search.")
         return
 
-    print(f"Found {len(results)} mint post(s) for {agent_name}.")
+    names = ", ".join(sorted(agent_names.keys()))
+    print(f"Found {len(results)} mint post(s) for {names}.")
     print("Available mint IDs:")
     for item in results:
         post_id = item.get("post_id") or "unknown"
         tick = item.get("tick") or "?"
         created = item.get("created_at") or ""
-        print(f"- {post_id} | {tick} | {created}")
+        agent = item.get("agent") or "?"
+        print(f"- {post_id} | {agent} | {tick} | {created}")
     selection = _prompt("Show which ID? (type 'all' for everything)", default="all", required=False)
     selection = (selection or "all").strip()
     if selection.lower() != "all":
@@ -1575,15 +1733,16 @@ def _cmd_my_mints(base_url, state):
             return
         results = filtered
 
-    print("tick | amount | created_at | url | status")
-    print("-" * 80)
+    print("agent | tick | amount | created_at | url | status")
+    print("-" * 96)
     for item in results:
+        agent = item.get("agent") or "?"
         tick = item.get("tick") or "?"
         amt = item.get("amt") or "?"
         created = item.get("created_at") or ""
         url = item.get("url") or ""
         status = item.get("verification_status") or "published"
-        print(f"{tick} | {amt} | {created} | {url} | {status}")
+        print(f"{agent} | {tick} | {amt} | {created} | {url} | {status}")
 
 
 def _set_llm_provider(provider, label, default_model, test_func):
