@@ -329,7 +329,7 @@ def _merge_numeric_fragments(tokens):
                 if not all(tokens[i + j].isalpha() for j in range(span)):
                     continue
                 combined = "".join(_normalize_word(tokens[i + j]) for j in range(span))
-                combined = _fix_number_word(combined)
+                combined = _normalize_number_token(combined)
                 if combined in _NUMBER_WORDS or combined in _SCALE_NUMBERS or combined == "and":
                     merged.append(combined)
                     i += span
@@ -337,7 +337,7 @@ def _merge_numeric_fragments(tokens):
                     break
             if matched:
                 continue
-            merged.append(_fix_number_word(norm))
+            merged.append(_normalize_number_token(norm))
         else:
             merged.append(token)
         i += 1
@@ -631,7 +631,7 @@ def _load_profiles(path):
 
 
 def _normalize_word(word):
-    return re.sub(r"(.)\1+", r"\1", word)
+    return re.sub(r"(.)\1{2,}", r"\1", word)
 
 
 def _collapse_duplicate_number_words(words):
@@ -649,10 +649,22 @@ def _normalize_number_token(token):
     if not token:
         return token
     if token.isalpha():
-        token = _normalize_word(token)
-        token = _fix_number_word(token)
+        token = token.lower()
         if token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and":
             return token
+        softened = _normalize_word(token)
+        if softened in _NUMBER_WORDS or softened in _SCALE_NUMBERS or softened == "and":
+            return softened
+        collapsed = re.sub(r"(.)\1+", r"\1", softened)
+        if collapsed in _NUMBER_WORDS or collapsed in _SCALE_NUMBERS or collapsed == "and":
+            return collapsed
+        fixed = _fix_number_word(collapsed)
+        if fixed in _NUMBER_WORDS or fixed in _SCALE_NUMBERS or fixed == "and":
+            return fixed
+        fixed = _fix_number_word(softened)
+        if fixed in _NUMBER_WORDS or fixed in _SCALE_NUMBERS or fixed == "and":
+            return fixed
+        return collapsed
     return token
 
 
@@ -667,7 +679,7 @@ def _fix_number_word(token):
         ]
         if len(candidates) == 1:
             return candidates[0]
-        if 4 <= len(token) <= 6:
+        if 4 <= len(token) <= 8:
             for word in (_NUMBER_WORDS | set(_SCALE_NUMBERS)):
                 if len(word) == len(token) + 1 and word[0] == token[0]:
                     if _is_subsequence(token, word):
@@ -687,6 +699,25 @@ def _format_number(value):
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value)
+
+
+def _is_number_str(token):
+    return bool(re.match(r"^-?\d+(?:\.\d+)?$", str(token)))
+
+
+def _extract_explicit_expr(tokens):
+    expr_tokens = []
+    i = 0
+    while i + 2 < len(tokens):
+        if _is_number_str(tokens[i]) and tokens[i + 1] in "+-*/" and _is_number_str(tokens[i + 2]):
+            if not expr_tokens:
+                expr_tokens.extend([tokens[i], tokens[i + 1], tokens[i + 2]])
+            else:
+                expr_tokens.extend([tokens[i + 1], tokens[i + 2]])
+            i += 2
+            continue
+        i += 1
+    return " ".join(expr_tokens).strip()
 
 
 def _build_llm_expression(challenge):
@@ -840,6 +871,9 @@ def _challenge_to_expr(challenge):
             i += 1
             continue
         i += 1
+    explicit_expr = _extract_explicit_expr(out)
+    if explicit_expr:
+        return explicit_expr, numbers, True
     return " ".join(out).strip(), numbers, has_operator
 
 
