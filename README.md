@@ -37,7 +37,7 @@ sudo apt install -y python3 python3-venv python3-pip git screen curl
 
 2) Clone this repo (replace with your GitHub URL):
 ```bash
-git clone https://github.com/yourname/Moltbook-agent-wizard-CLI.git
+git clone https://github.com/papa-multi/Moltbook-agent-wizard-CLI.git
 cd Moltbook-agent-wizard-CLI
 ```
 
