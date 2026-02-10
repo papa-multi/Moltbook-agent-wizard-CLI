@@ -20,6 +20,15 @@ MBC20_TOKEN_URLS = (
 PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".config", "moltbook-wizard")
 PROFILES_PATH = os.path.join(PROFILE_DIR, "profiles.json")
 VERIFICATION_LOG_PATH = os.path.join(PROFILE_DIR, "verification_log.json")
+LLM_CONFIG_PATH = os.path.join(PROFILE_DIR, "llm_config.json")
+OPENROUTER_CONFIG_PATH = os.path.join(PROFILE_DIR, "openrouter.json")
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+DEFAULT_OPENROUTER_MODEL = "openrouter/auto"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+LLM_PROVIDERS = ("openrouter", "openai", "gemini")
 
 _SMALL_NUMBERS = {
     "zero": 0,
@@ -85,6 +94,38 @@ _SUM_HINTS = {
     "accelerates",
     "new velocity",
     "new speed",
+    "velocity",
+    "speed",
+    "force",
+    "gains",
+    "gain",
+    "increase",
+    "increases",
+    "added",
+    "add",
+    "plus",
+}
+_SUBTRACT_HINTS = {
+    "difference",
+    "minus",
+    "subtract",
+    "subtracted",
+    "less",
+    "decrease",
+    "decreases",
+    "reduced",
+}
+_MULTIPLY_HINTS = {
+    "product",
+    "times",
+    "multiplied",
+    "multiply",
+}
+_DIVIDE_HINTS = {
+    "divide",
+    "divided",
+    "over",
+    "quotient",
 }
 
 
@@ -203,6 +244,326 @@ def _save_profiles(data):
     with open(PROFILES_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
     os.chmod(PROFILES_PATH, 0o600)
+
+
+def _load_llm_config():
+    data = {}
+    if os.path.exists(LLM_CONFIG_PATH):
+        try:
+            with open(LLM_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if "openrouter" not in data and os.path.exists(OPENROUTER_CONFIG_PATH):
+        try:
+            with open(OPENROUTER_CONFIG_PATH, "r", encoding="utf-8") as f:
+                legacy = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            legacy = {}
+        if isinstance(legacy, dict) and legacy.get("api_key"):
+            data["openrouter"] = {
+                "api_key": legacy.get("api_key"),
+                "model": legacy.get("model", DEFAULT_OPENROUTER_MODEL),
+            }
+    return data
+
+
+def _save_llm_config(data):
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    with open(LLM_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.chmod(LLM_CONFIG_PATH, 0o600)
+
+
+def _get_llm_provider_config(provider):
+    return _load_llm_config().get(provider, {})
+
+
+def _get_preferred_provider():
+    preferred = _load_llm_config().get("preferred_provider")
+    if preferred in LLM_PROVIDERS:
+        return preferred
+    return None
+
+
+def _get_openrouter_key():
+    env_key = os.getenv("OPENROUTER_API_KEY")
+    if env_key:
+        return env_key
+    return _get_llm_provider_config("openrouter").get("api_key")
+
+
+def _get_openrouter_model():
+    env_model = os.getenv("OPENROUTER_MODEL")
+    if env_model:
+        return env_model
+    return _get_llm_provider_config("openrouter").get("model", DEFAULT_OPENROUTER_MODEL)
+
+
+def _get_openai_key():
+    env_key = os.getenv("OPENAI_API_KEY")
+    if env_key:
+        return env_key
+    return _get_llm_provider_config("openai").get("api_key")
+
+
+def _get_openai_model():
+    env_model = os.getenv("OPENAI_MODEL")
+    if env_model:
+        return env_model
+    return _get_llm_provider_config("openai").get("model", DEFAULT_OPENAI_MODEL)
+
+
+def _get_gemini_key():
+    env_key = os.getenv("GEMINI_API_KEY")
+    if env_key:
+        return env_key
+    return _get_llm_provider_config("gemini").get("api_key")
+
+
+def _get_gemini_model():
+    env_model = os.getenv("GEMINI_MODEL")
+    if env_model:
+        return env_model
+    return _get_llm_provider_config("gemini").get("model", DEFAULT_GEMINI_MODEL)
+
+
+def _extract_number(text):
+    if not text:
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return f"{float(match.group(0)):.2f}"
+    except ValueError:
+        return None
+
+
+def _extract_message_content(message):
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if text:
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _build_math_prompt(challenge):
+    return (
+        "You are a precise calculator. The input is noisy with repeated letters and words. "
+        "Normalize by collapsing repeated letters, and if the same number word repeats "
+        "consecutively, count it once (e.g., 'seven seven' -> 7, 'twenty twenty three' -> 23). "
+        "Solve the math problem and return only the final numeric answer formatted with exactly "
+        f"two decimal places. Problem: {challenge}. Final answer:"
+    )
+
+
+def _mint_title():
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return f"mint task {timestamp}"
+
+
+def _solve_with_openrouter(challenge):
+    api_key = _get_openrouter_key()
+    if not api_key:
+        return None, None
+    model = _get_openrouter_model()
+    prompt = _build_math_prompt(challenge)
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 64,
+        "messages": [
+            {"role": "system", "content": "You are a precise calculator."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://moltbook-wizard.local",
+        "X-Title": "Moltbook Wizard",
+    }
+    try:
+        resp = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=20)
+    except requests.RequestException as exc:
+        return None, f"OpenRouter request failed: {exc}"
+    if resp.status_code not in (200, 201):
+        return None, f"OpenRouter HTTP {resp.status_code}: {resp.text}"
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, "OpenRouter response was not JSON"
+    content = ""
+    choices = data.get("choices") or []
+    if choices:
+        message = choices[0].get("message") or {}
+        content = _extract_message_content(message)
+    answer = _extract_number(content)
+    if not answer:
+        return None, "OpenRouter returned no usable number"
+    return answer, None
+
+
+def _solve_with_openai(challenge):
+    api_key = _get_openai_key()
+    if not api_key:
+        return None, None
+    model = _get_openai_model()
+    prompt = _build_math_prompt(challenge)
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 64,
+        "messages": [
+            {"role": "system", "content": "You are a precise calculator."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=20)
+    except requests.RequestException as exc:
+        return None, f"OpenAI request failed: {exc}"
+    if resp.status_code not in (200, 201):
+        return None, f"OpenAI HTTP {resp.status_code}: {resp.text}"
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, "OpenAI response was not JSON"
+    content = ""
+    choices = data.get("choices") or []
+    if choices:
+        message = choices[0].get("message") or {}
+        content = _extract_message_content(message)
+    answer = _extract_number(content)
+    if not answer:
+        return None, "OpenAI returned no usable number"
+    return answer, None
+
+
+def _extract_gemini_text(data):
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return ""
+    content = candidates[0].get("content")
+    if isinstance(content, dict):
+        parts = content.get("parts") or []
+        texts = []
+        for part in parts:
+            if isinstance(part, dict) and part.get("text"):
+                texts.append(part["text"])
+            elif isinstance(part, str):
+                texts.append(part)
+        if texts:
+            return "\n".join(texts).strip()
+    if isinstance(content, str):
+        return content.strip()
+    for key in ("text", "output"):
+        value = candidates[0].get(key)
+        if isinstance(value, str):
+            return value.strip()
+    for key in ("output_text", "outputText"):
+        value = candidates[0].get(key)
+        if isinstance(value, str):
+            return value.strip()
+    return ""
+
+
+def _solve_with_gemini(challenge):
+    api_key = _get_gemini_key()
+    if not api_key:
+        return None, None
+    model = _get_gemini_model()
+    prompt = _build_math_prompt(challenge)
+    candidates = [model]
+    if model == DEFAULT_GEMINI_MODEL:
+        candidates += [
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro-latest",
+            "gemini-1.5-pro",
+        ]
+    last_error = None
+    for candidate in candidates:
+        url = GEMINI_API_URL.format(model=candidate, api_key=api_key)
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 64,
+                "responseMimeType": "text/plain",
+            },
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+        except requests.RequestException as exc:
+            return None, f"Gemini request failed: {exc}"
+        if resp.status_code not in (200, 201):
+            if resp.status_code == 404 and candidate != candidates[-1]:
+                last_error = f"Gemini HTTP 404 for model {candidate}"
+                continue
+            return None, f"Gemini HTTP {resp.status_code}: {resp.text}"
+        try:
+            data = resp.json()
+        except ValueError:
+            return None, "Gemini response was not JSON"
+        content = _extract_gemini_text(data)
+        answer = _extract_number(content)
+        if not answer:
+            return None, "Gemini returned no usable number"
+        return answer, None
+    if last_error:
+        return None, last_error
+    return None, "Gemini returned no usable number"
+
+
+def _test_openrouter():
+    answer, error = _solve_with_openrouter("2 + 2")
+    if not answer:
+        return False, error or "OpenRouter test failed"
+    if answer != "4.00":
+        return False, f"OpenRouter returned {answer}"
+    return True, "OpenRouter OK"
+
+
+def _test_openai():
+    answer, error = _solve_with_openai("2 + 2")
+    if not answer:
+        return False, error or "OpenAI test failed"
+    if answer != "4.00":
+        return False, f"OpenAI returned {answer}"
+    return True, "OpenAI OK"
+
+
+def _test_gemini():
+    answer, error = _solve_with_gemini("2 + 2")
+    if not answer:
+        return False, error or "Gemini test failed"
+    if answer != "4.00":
+        return False, f"Gemini returned {answer}"
+    return True, "Gemini OK"
 
 
 def _load_verification_log():
@@ -400,6 +761,22 @@ def _words_to_number(words):
     return total + current
 
 
+def _is_number_token(token):
+    if re.match(r"\d", token or ""):
+        return True
+    if token and token.isalpha():
+        token = _normalize_word(token)
+        return token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and"
+    return False
+
+
+def _has_number_ahead(tokens, start):
+    for idx in range(start, len(tokens)):
+        if _is_number_token(tokens[idx]):
+            return True
+    return False
+
+
 def _challenge_to_expr(challenge):
     if not challenge:
         return "", [], False
@@ -408,12 +785,14 @@ def _challenge_to_expr(challenge):
     out = []
     numbers = []
     has_operator = False
+    prev_number = False
     i = 0
     while i < len(tokens):
         token = tokens[i]
         if token in _OP_WORDS:
             out.append(_OP_WORDS[token])
             has_operator = True
+            prev_number = False
             i += 1
             continue
         if re.match(r"\d", token):
@@ -422,6 +801,7 @@ def _challenge_to_expr(challenge):
                 numbers.append(float(token))
             except ValueError:
                 pass
+            prev_number = True
             i += 1
             continue
         if token.isalpha():
@@ -441,11 +821,23 @@ def _challenge_to_expr(challenge):
             value = _words_to_number(words)
             out.append(str(value))
             numbers.append(float(value))
+            prev_number = True
             i = j
             continue
         if token in "+-*/()":
+            if token in "+-*/":
+                if not prev_number:
+                    i += 1
+                    continue
+                if not _has_number_ahead(tokens, i + 1):
+                    i += 1
+                    continue
+                out.append(token)
+                has_operator = True
+                prev_number = False
+                i += 1
+                continue
             out.append(token)
-            has_operator = True
             i += 1
             continue
         i += 1
@@ -487,6 +879,23 @@ def _solve_math_challenge(challenge):
     expr, numbers, has_operator = _challenge_to_expr(challenge)
     if not expr and not numbers:
         return None, "empty challenge"
+    solvers = {
+        "openrouter": _solve_with_openrouter,
+        "openai": _solve_with_openai,
+        "gemini": _solve_with_gemini,
+    }
+    preferred = _get_preferred_provider()
+    if preferred:
+        solver = solvers.get(preferred)
+        if solver:
+            answer, error = solver(challenge)
+            if answer:
+                return answer, None
+            if error:
+                return None, error
+            return None, f"preferred provider '{preferred}' not configured"
+        return None, f"preferred provider '{preferred}' not supported"
+
     if expr:
         try:
             result = _safe_eval(expr)
@@ -494,8 +903,28 @@ def _solve_math_challenge(challenge):
         except Exception:
             pass
     challenge_lower = (challenge or "").lower()
-    if numbers and (not has_operator) and any(hint in challenge_lower for hint in _SUM_HINTS):
+    if numbers and any(hint in challenge_lower for hint in _SUM_HINTS):
         return f"{sum(numbers):.2f}", None
+    if len(numbers) >= 2 and any(hint in challenge_lower for hint in _SUBTRACT_HINTS):
+        return f"{numbers[0] - numbers[1]:.2f}", None
+    if len(numbers) >= 2 and any(hint in challenge_lower for hint in _MULTIPLY_HINTS):
+        return f"{numbers[0] * numbers[1]:.2f}", None
+    if len(numbers) >= 2 and any(hint in challenge_lower for hint in _DIVIDE_HINTS):
+        if numbers[1] == 0:
+            return None, "division by zero"
+        return f"{numbers[0] / numbers[1]:.2f}", None
+    last_error = None
+    for name in LLM_PROVIDERS:
+        solver = solvers.get(name)
+        if not solver:
+            continue
+        answer, error = solver(challenge)
+        if answer:
+            return answer, None
+        if error:
+            last_error = error
+    if last_error:
+        return None, last_error
     return None, "unable to solve challenge automatically"
 
 
@@ -533,29 +962,19 @@ def _handle_verification(base_url, api_key, data):
     if challenge:
         auto_answer, auto_error = _solve_math_challenge(challenge)
         if auto_answer:
-            print(f"Auto-solved answer: {auto_answer}")
-            if _prompt_yes_no("Submit this answer now?", default=True):
-                payload = {"verification_code": code, "answer": auto_answer}
-                verify_data = _request("POST", f"{base_url}/verify", api_key=api_key, json_body=payload)
-                if verify_data:
-                    print("Verification response:")
-                    _pretty_json(verify_data)
-                    _update_verification_status(code, "verified", answer=auto_answer)
-                else:
-                    _update_verification_status(code, "failed", answer=auto_answer)
-                return
-        elif auto_error:
+            print(f"Auto-solved answer: {auto_answer} (submitting)")
+            payload = {"verification_code": code, "answer": auto_answer}
+            verify_data = _request("POST", f"{base_url}/verify", api_key=api_key, json_body=payload)
+            if verify_data:
+                print("Verification response:")
+                _pretty_json(verify_data)
+                _update_verification_status(code, "verified", answer=auto_answer)
+            else:
+                _update_verification_status(code, "failed", answer=auto_answer)
+            return
+        if auto_error:
             print(f"Auto-solve failed: {auto_error}")
-
-    answer = _prompt("Answer (2 decimals, e.g., 75.00)", required=True)
-    payload = {"verification_code": code, "answer": answer}
-    verify_data = _request("POST", f"{base_url}/verify", api_key=api_key, json_body=payload)
-    if verify_data:
-        print("Verification response:")
-        _pretty_json(verify_data)
-        _update_verification_status(code, "verified", answer=answer)
-    else:
-        _update_verification_status(code, "failed", answer=answer)
+    print("No automatic answer available. Use option 6 to retry after adding an LLM API key.")
 
 
 def _cmd_register(base_url, state):
@@ -582,6 +1001,33 @@ def _cmd_register(base_url, state):
             state["profile_name"] = profile_name
     if claim_url:
         print(f"Claim URL: {claim_url}")
+
+
+def _cmd_add_existing(base_url, state):
+    _print_header("Add an existing agent")
+    print("You need: the agent's Moltbook API key.")
+    api_key = _prompt("Moltbook API key", secret=True)
+    if not api_key:
+        print("No API key provided.")
+        return
+    data = _request("GET", f"{base_url}/agents/me", api_key=api_key)
+    if not data:
+        if not _prompt_yes_no("Unable to verify this key. Save anyway?", default=False):
+            return
+        agent_name = "existing-agent"
+    else:
+        agent = data.get("agent", data)
+        agent_name = agent.get("name") or "existing-agent"
+        print(f"Detected agent: {agent_name}")
+
+    profiles = _load_profiles()
+    profile_name = _prompt("Profile name", default=agent_name)
+    profiles["profiles"][profile_name] = {"api_key": api_key}
+    profiles["active"] = profile_name
+    _save_profiles(profiles)
+    state["api_key"] = api_key
+    state["profile_name"] = profile_name
+    print(f"Saved profile: {profile_name}")
 
 
 def _cmd_status(base_url, state):
@@ -630,7 +1076,7 @@ def _cmd_mint(base_url, state):
         ):
             content = f"mbc20.xyz\n{content}"
         submolt = _prompt("Submolt", default="mbc20")
-        title = f"mbc-20 mint {tick}".strip()
+        title = _mint_title()
         body = {"submolt": submolt, "title": title, "content": content}
         data = _request("POST", f"{base_url}/posts", api_key=api_key, json_body=body)
         if data:
@@ -647,7 +1093,7 @@ def _cmd_mint(base_url, state):
     payload = {"p": "mbc-20", "op": "mint", "tick": tick, "amt": str(amount)}
     payload_str = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
     content = f"mbc20.xyz\n{payload_str}" if include_prefix else payload_str
-    title = f"mbc-20 mint {tick}"
+    title = _mint_title()
     body = {"submolt": submolt, "title": title, "content": content}
     data = _request("POST", f"{base_url}/posts", api_key=api_key, json_body=body)
     if data:
@@ -676,6 +1122,24 @@ def _cmd_link(base_url, state):
 def _cmd_verify(base_url, state):
     _print_header("Verify a post")
     api_key = _get_api_key(state)
+
+    def _submit_verification(code, challenge):
+        if not code or not challenge:
+            print("Missing verification code or challenge text.")
+            return
+        answer, error = _solve_math_challenge(challenge)
+        if not answer:
+            print(f"Auto-solve failed: {error}")
+            return
+        print(f"Auto-solved answer: {answer} (submitting)")
+        payload = {"verification_code": code, "answer": answer}
+        data = _request("POST", f"{base_url}/verify", api_key=api_key, json_body=payload)
+        if data:
+            _pretty_json(data)
+            _update_verification_status(code, "verified", answer=answer)
+        else:
+            _update_verification_status(code, "failed", answer=answer)
+
     pending = _pending_verification_entries()
     if pending:
         print("Saved challenges:")
@@ -686,7 +1150,7 @@ def _cmd_verify(base_url, state):
             post_id = entry.get("post_id") or "unknown"
             expires_at = entry.get("expires_at") or "unknown"
             print(f"{idx}) {post_id} | expires {expires_at} | {challenge}")
-        choice = _prompt("Select challenge number (or press Enter to enter manually)", required=False)
+        choice = _prompt("Select challenge number (or press Enter to paste a code + challenge)", required=False)
         if choice:
             if not choice.isdigit() or not (1 <= int(choice) <= len(pending)):
                 print("Invalid selection.")
@@ -694,48 +1158,39 @@ def _cmd_verify(base_url, state):
             entry = pending[int(choice) - 1]
             code = entry.get("code")
             challenge = entry.get("challenge")
-            if challenge:
-                auto_answer, auto_error = _solve_math_challenge(challenge)
-                if auto_answer:
-                    print(f"Auto-solved answer: {auto_answer}")
-                    if _prompt_yes_no("Submit this answer now?", default=True):
-                        payload = {"verification_code": code, "answer": auto_answer}
-                        data = _request("POST", f"{base_url}/verify", api_key=api_key, json_body=payload)
-                        if data:
-                            _pretty_json(data)
-                            _update_verification_status(code, "verified", answer=auto_answer)
-                        else:
-                            _update_verification_status(code, "failed", answer=auto_answer)
-                        return
-                elif auto_error:
-                    print(f"Auto-solve failed: {auto_error}")
-            answer = _prompt("Answer (2 decimals, e.g., 75.00)")
-            payload = {"verification_code": code, "answer": answer}
-            data = _request("POST", f"{base_url}/verify", api_key=api_key, json_body=payload)
-            if data:
-                _pretty_json(data)
-                _update_verification_status(code, "verified", answer=answer)
-            else:
-                _update_verification_status(code, "failed", answer=answer)
+            _submit_verification(code, challenge)
             return
+        code = _prompt("Verification code", required=False)
+        if not code:
+            return
+        if not re.fullmatch(r"[a-fA-F0-9]{64}", code):
+            print("Warning: this does not look like a post verification code.")
+            print("Post codes are 64 hex chars; claim codes like claw-XXXX won't work.")
+            if not _prompt_yes_no("Continue anyway?", default=False):
+                return
+        challenge = _prompt_multiline("Paste the challenge text exactly")
+        if not challenge:
+            print("Challenge text is required for automatic solving.")
+            return
+        _record_verification({"code": code, "challenge": challenge, "status": "pending"})
+        _submit_verification(code, challenge)
+        return
 
     print("No saved challenges found.")
-    if not _prompt_yes_no("Enter a verification code manually?", default=False):
+    code = _prompt("Verification code", required=False)
+    if not code:
         return
-    code = _prompt("Verification code")
     if not re.fullmatch(r"[a-fA-F0-9]{64}", code):
         print("Warning: this does not look like a post verification code.")
         print("Post codes are 64 hex chars; claim codes like claw-XXXX won't work.")
         if not _prompt_yes_no("Continue anyway?", default=False):
             return
-    answer = _prompt("Answer (2 decimals, e.g., 75.00)")
-    payload = {"verification_code": code, "answer": answer}
-    data = _request("POST", f"{base_url}/verify", api_key=api_key, json_body=payload)
-    if data:
-        _pretty_json(data)
-        _update_verification_status(code, "verified", answer=answer)
-    else:
-        _update_verification_status(code, "failed", answer=answer)
+    challenge = _prompt_multiline("Paste the challenge text exactly")
+    if not challenge:
+        print("Challenge text is required for automatic solving.")
+        return
+    _record_verification({"code": code, "challenge": challenge, "status": "pending"})
+    _submit_verification(code, challenge)
 
 
 def _extract_tokens(data):
@@ -915,6 +1370,27 @@ def _cmd_my_mints(base_url, state):
         print(f"{tick} | {amt} | {created} | {url} | {status}")
 
 
+def _set_llm_provider(provider, label, default_model, test_func):
+    api_key = _prompt(f"{label} API key", secret=True)
+    if not api_key:
+        print("No key provided.")
+        return
+    model = _prompt(f"{label} model", default=default_model)
+    config = _load_llm_config()
+    config[provider] = {"api_key": api_key, "model": model}
+    _save_llm_config(config)
+    ok, message = test_func()
+    if ok:
+        config = _load_llm_config()
+        config["preferred_provider"] = provider
+        _save_llm_config(config)
+        print(f"{label} test OK.")
+        print(f"Preferred LLM set to: {provider}")
+    else:
+        print(f"{label} test failed: {message}")
+        print("Key saved anyway. Check network access, model name, or quota.")
+
+
 def _cmd_accounts(state):
     _print_header("Manage accounts")
     profiles = _load_profiles()
@@ -925,7 +1401,10 @@ def _cmd_accounts(state):
         print("1) Add account")
         print("2) Switch account")
         print("3) Remove account")
-        print("4) Back")
+        print("4) Set OpenRouter API key")
+        print("5) Set OpenAI (ChatGPT) API key")
+        print("6) Set Gemini API key")
+        print("7) Back")
         choice = _prompt("Select", required=True)
         if choice == "1":
             name = _prompt("Profile name")
@@ -961,6 +1440,12 @@ def _cmd_accounts(state):
                     state.pop("profile_name", None)
                     state.pop("api_key", None)
         elif choice == "4":
+            _set_llm_provider("openrouter", "OpenRouter", DEFAULT_OPENROUTER_MODEL, _test_openrouter)
+        elif choice == "5":
+            _set_llm_provider("openai", "OpenAI", DEFAULT_OPENAI_MODEL, _test_openai)
+        elif choice == "6":
+            _set_llm_provider("gemini", "Gemini", DEFAULT_GEMINI_MODEL, _test_gemini)
+        elif choice == "7":
             break
         else:
             print("Please choose a valid option.")
@@ -969,13 +1454,13 @@ def _cmd_accounts(state):
 def _menu():
     print("\nWhat do you want to do?")
     print("1) Create a Moltbook agent")
-    print("2) Check claim status")
-    print("3) Create a post")
-    print("4) Mint an MBC-20 inscription")
-    print("5) Link a wallet (optional)")
-    print("6) Verify a post challenge")
-    print("7) Show my minted items")
-    print("8) Show minted tokens (mbc20.xyz)")
+    print("2) Add an existing agent (API key)")
+    print("3) Check claim status")
+    print("4) Create a post")
+    print("5) Mint an MBC-20 inscription")
+    print("6) Link a wallet (optional)")
+    print("7) Verify a post challenge")
+    print("8) Show my minted items")
     print("9) Manage accounts")
     print("10) Auto-mint every 2 hours (all accounts)")
     print("11) Next allowed request time")
@@ -1018,8 +1503,16 @@ def _cmd_auto_mint():
     prefix = "mbc20.xyz"
     interval = "120"
     screen_name = f"auto-mint-{tick.lower()}"
+    log_path = os.path.join(PROFILE_DIR, f"{screen_name}.log")
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    try:
+        with open(log_path, "a", encoding="utf-8"):
+            pass
+    except OSError:
+        pass
     args = [
         sys.executable,
+        "-u",
         _script_path("auto_mint_scheduler.py"),
         "--tick",
         tick,
@@ -1032,9 +1525,10 @@ def _cmd_auto_mint():
         "--interval-minutes",
         interval,
         "--require-claimed",
+        "--loop",
     ]
     inner = " ".join(shlex.quote(part) for part in args)
-    loop_cmd = f"while true; do {inner}; sleep {int(interval) * 60}; done"
+    loop_cmd = f"{inner} |& tee -a {shlex.quote(log_path)}"
     screen_cmd = ["screen", "-dmS", screen_name, "bash", "-lc", loop_cmd]
     try:
         result = subprocess.run(screen_cmd, check=False)
@@ -1047,6 +1541,7 @@ def _cmd_auto_mint():
     print(f"Started screen session: {screen_name}")
     print(f"View: screen -r {screen_name}")
     print(f"Stop: screen -S {screen_name} -X quit")
+    print(f"Logs: {log_path}")
 
 
 def _cmd_next_request():
@@ -1086,19 +1581,19 @@ def main():
             if choice == "1":
                 _cmd_register(base_url, state)
             elif choice == "2":
-                _cmd_status(base_url, state)
+                _cmd_add_existing(base_url, state)
             elif choice == "3":
-                _cmd_post(base_url, state)
+                _cmd_status(base_url, state)
             elif choice == "4":
-                _cmd_mint(base_url, state)
+                _cmd_post(base_url, state)
             elif choice == "5":
-                _cmd_link(base_url, state)
+                _cmd_mint(base_url, state)
             elif choice == "6":
-                _cmd_verify(base_url, state)
+                _cmd_link(base_url, state)
             elif choice == "7":
-                _cmd_my_mints(base_url, state)
+                _cmd_verify(base_url, state)
             elif choice == "8":
-                _cmd_tokens()
+                _cmd_my_mints(base_url, state)
             elif choice == "9":
                 _cmd_accounts(state)
             elif choice == "10":

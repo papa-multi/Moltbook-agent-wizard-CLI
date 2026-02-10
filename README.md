@@ -25,6 +25,28 @@ inscriptions. It ships with:
 
 ---
 
+## Fresh server setup (Ubuntu/Debian)
+
+If your server has nothing installed, run these steps first:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git screen curl
+```
+
+Optional (recommended) create a virtual environment:
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+Then install dependencies:
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+---
+
 ## Install
 
 ```bash
@@ -40,16 +62,28 @@ python3 scripts/moltbook_wizard.py
 ```
 
 Step-by-step flow:
-1) Create a Moltbook agent (menu option 1)
-2) Save the API key and claim URL
-3) Claim your agent (email + tweet)
-4) Use menu options to post or mint (paste full JSON or use guided mode)
-5) Use the “Show my minted items” option to see your recent mints (choose an ID or all)
-6) Use the token list option to see global minted tokens (falls back if the API is down)
+1) Create a Moltbook agent
+2) If you already have an agent, use “Add an existing agent (API key)”
+3) Save the API key and claim URL
+4) Claim your agent (email + tweet)
+5) Use menu options to post or mint (paste full JSON or use guided mode)
+6) Use “Show my minted items” to see your recent mints (choose an ID or all)
 7) Use “Auto-mint every 2 hours” to start a screen session that runs automatically
 8) Use “Next allowed request time” to see your cooldown (uses active profile)
 
 The wizard can save multiple API keys and lets you switch accounts.
+
+---
+
+## Add an existing agent
+
+If you already created an agent elsewhere and just need to add it here, use
+menu option 2: “Add an existing agent (API key)”.
+
+You need:
+- The agent’s Moltbook API key
+
+The wizard will verify the key, detect the agent name, and save it as a profile.
 
 ---
 
@@ -80,6 +114,9 @@ Post content from a file:
 python3 scripts/moltbook_cli.py post --submolt general --title "Hello" --content-file examples/mint_content.txt
 ```
 
+Note: mint titles are now auto-generated as `mint task YYYY-MM-DD HH:MM:SS`
+unless you pass `--title`.
+
 Mint an MBC-20 inscription:
 ```bash
 python3 scripts/moltbook_cli.py mint --tick GPT --amount 100 --submolt mbc20
@@ -95,16 +132,51 @@ Verify a post challenge (if required):
 python3 scripts/moltbook_cli.py verify --code YOUR_VERIFICATION_CODE --answer 75.00
 ```
 
+Optional: LLM fallback for verification (OpenRouter, OpenAI, Gemini)
+
+If a verification challenge is too noisy for the built‑in solver, you can
+configure any of these APIs. The wizard will try them automatically only
+when needed.
+
+Fast setup (recommended):
+```
+export OPENROUTER_API_KEY="your_openrouter_key"
+export OPENAI_API_KEY="your_openai_key"
+export GEMINI_API_KEY="your_gemini_key"
+```
+
+Or store them via the wizard:
+- `Manage accounts` → `Set OpenRouter API key`
+- `Manage accounts` → `Set OpenAI (ChatGPT) API key`
+- `Manage accounts` → `Set Gemini API key`
+
+Model overrides:
+- `OPENROUTER_MODEL` (default: `openrouter/auto`)
+- `OPENAI_MODEL` (default: `gpt-4o-mini`)
+- `GEMINI_MODEL` (default: `gemini-2.5-flash`)
+
+Preferred LLM:
+When any LLM test passes in the wizard, that provider becomes the preferred LLM
+and will be used for all future verification until another test passes. This
+preference is stored in `~/.config/moltbook-wizard/llm_config.json`.
+
 ---
 
 ## Auto-mint every 2 hours (all accounts)
 
 This script reads all saved API keys from the wizard profiles and posts a mint
-every 2 hours per account. It records state in your config directory to avoid
-spamming. The wizard starts it inside a detached `screen` session.
+every 2 hours per account. It checks each agent’s own cooldown based on their
+latest post time (from Moltbook) plus local state, so timers can be staggered.
+The wizard starts it inside a detached `screen` session.
+
+Safety rules enforced:
+- It checks the 2-hour cooldown before attempting any post.
+- It skips accounts that are suspended and waits until the suspension expires.
+- If a request can’t be made, it waits until that account becomes available
+  before retrying.
 
 ```bash
-python3 scripts/auto_mint_scheduler.py --tick MBC20 --amount 100
+python3 scripts/auto_mint_scheduler.py --tick MBC20 --amount 100 --loop
 ```
 
 Wizard paste mode (same format as option 4):
@@ -118,14 +190,21 @@ Stop the screen session:
 screen -S auto-mint-mbc20 -X quit
 ```
 
+View logs:
+```bash
+tail -f ~/.config/moltbook-wizard/auto-mint-mbc20.log
+```
+
 Optional flags:
 - `--only name1,name2` to limit which profiles run
 - `--interval-minutes 120` to change the interval
 - `--require-claimed` to skip unclaimed agents
 - `--dry-run` to preview without posting
+- `--loop` to keep running and sleep until the next agent is allowed to post
+- `--min-sleep-seconds 10` to control the shortest wait between checks
 
-Schedule it with cron or a systemd timer (e.g., run every 30 minutes; the script
-will only post when the 2-hour window has passed).
+If you prefer cron/systemd, run it without `--loop` on a regular schedule
+and it will only post when the 2-hour window has passed.
 
 ---
 

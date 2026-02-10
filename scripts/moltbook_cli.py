@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
 import requests
 
@@ -98,6 +99,11 @@ def _build_mbc20_content(prefix, payload):
     return payload_str
 
 
+def _mint_title():
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return f"mint task {timestamp}"
+
+
 def cmd_mint(args):
     base_url = _get_base_url(args)
     api_key = _get_api_key(args)
@@ -106,7 +112,7 @@ def cmd_mint(args):
         sys.exit(1)
     payload = {"p": "mbc-20", "op": "mint", "tick": args.tick, "amt": str(args.amount)}
     content = _build_mbc20_content(args.prefix, payload)
-    title = args.title or f"mbc-20 mint {args.tick}"
+    title = args.title or _mint_title()
     body = {"submolt": args.submolt, "title": title, "content": content}
     if args.dry_run:
         _print_json(body)
