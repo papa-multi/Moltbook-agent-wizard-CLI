@@ -243,6 +243,15 @@ def _extract_number(text):
         return None
 
 
+def _format_answer(value):
+    if value is None:
+        return None
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return value
+
+
 def _extract_message_content(message):
     if not isinstance(message, dict):
         return ""
@@ -263,12 +272,12 @@ def _extract_message_content(message):
 
 
 def _build_math_prompt(challenge):
+    expr = _build_llm_expression(challenge)
+    if expr:
+        return f"Calculate: {expr}. Return only the number with exactly two decimal places."
     return (
-        "You are a precise calculator. The input is noisy with repeated letters and words. "
-        "Normalize by collapsing repeated letters, and if the same number word repeats "
-        "consecutively, count it once (e.g., 'seven seven' -> 7, 'twenty twenty three' -> 23). "
-        "Solve the math problem and return only the final numeric answer formatted with exactly "
-        f"two decimal places. Problem: {challenge}. Final answer:"
+        "Calculate the result and return only the number with exactly two decimal places: "
+        f"{challenge}"
     )
 
 
@@ -441,7 +450,57 @@ def _load_profiles(path):
 
 
 def _normalize_word(word):
-    return re.sub(r"(.)\\1+", r"\\1", word)
+    return re.sub(r"(.)\1+", r"\1", word)
+
+
+def _collapse_duplicate_number_words(words):
+    collapsed = []
+    prev = None
+    for word in words:
+        if word == prev and (word in _NUMBER_WORDS or word in _SCALE_NUMBERS):
+            continue
+        collapsed.append(word)
+        prev = word
+    return collapsed
+
+
+def _format_number(value):
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _build_llm_expression(challenge):
+    expr, numbers, has_operator = _challenge_to_expr(challenge)
+    if not has_operator and len(numbers) < 2:
+        return ""
+    expr = (expr or "").strip()
+    if expr and any(op in expr for op in "+-*/"):
+        try:
+            _safe_eval(expr)
+            return expr
+        except Exception:
+            pass
+    challenge_lower = (challenge or "").lower()
+    op = None
+    if numbers and any(hint in challenge_lower for hint in _SUM_HINTS):
+        op = "+"
+    elif len(numbers) >= 2 and any(hint in challenge_lower for hint in _SUBTRACT_HINTS):
+        op = "-"
+    elif len(numbers) >= 2 and any(hint in challenge_lower for hint in _MULTIPLY_HINTS):
+        op = "*"
+    elif len(numbers) >= 2 and any(hint in challenge_lower for hint in _DIVIDE_HINTS):
+        op = "/"
+    if numbers:
+        formatted = [_format_number(n) for n in numbers]
+        if op == "+":
+            return " + ".join(formatted)
+        if op in ("-", "*", "/") and len(formatted) >= 2:
+            return f"{formatted[0]} {op} {formatted[1]}"
+        if len(formatted) >= 2:
+            return " + ".join(formatted)
+        return formatted[0]
+    return ""
 
 
 def _words_to_number(words):
@@ -463,6 +522,28 @@ def _words_to_number(words):
     return total + current
 
 
+def _is_number_token(token):
+    if re.match(r"\d", token or ""):
+        return True
+    if token and token.isalpha():
+        token = _normalize_word(token)
+        return token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and"
+    return False
+
+
+def _has_number_ahead(tokens, start):
+    for idx in range(start, len(tokens)):
+        token = tokens[idx]
+        if _is_number_token(token):
+            return True
+        if token and token.isalpha() and idx + 1 < len(tokens) and tokens[idx + 1].isalpha():
+            left = _normalize_word(token)
+            right = _normalize_word(tokens[idx + 1])
+            if left + right in _NUMBER_WORDS or left + right in _SCALE_NUMBERS:
+                return True
+    return False
+
+
 def _challenge_to_expr(challenge):
     if not challenge:
         return "", [], False
@@ -471,12 +552,14 @@ def _challenge_to_expr(challenge):
     out = []
     numbers = []
     has_operator = False
+    prev_number = False
     i = 0
     while i < len(tokens):
         token = tokens[i]
         if token in _OP_WORDS:
             out.append(_OP_WORDS[token])
             has_operator = True
+            prev_number = False
             i += 1
             continue
         if re.match(r"\d", token):
@@ -485,6 +568,7 @@ def _challenge_to_expr(challenge):
                 numbers.append(float(token))
             except ValueError:
                 pass
+            prev_number = True
             i += 1
             continue
         if token.isalpha():
@@ -501,14 +585,27 @@ def _challenge_to_expr(challenge):
                     j += 1
                     continue
                 break
+            words = _collapse_duplicate_number_words(words)
             value = _words_to_number(words)
             out.append(str(value))
             numbers.append(float(value))
+            prev_number = True
             i = j
             continue
         if token in "+-*/()":
+            if token in "+-*/":
+                if not prev_number:
+                    i += 1
+                    continue
+                if not _has_number_ahead(tokens, i + 1):
+                    i += 1
+                    continue
+                out.append(token)
+                has_operator = True
+                prev_number = False
+                i += 1
+                continue
             out.append(token)
-            has_operator = True
             i += 1
             continue
         i += 1
@@ -577,26 +674,58 @@ def _solve_math_challenge(challenge):
         "gemini": _solve_with_gemini,
     }
     preferred = _get_preferred_provider()
+    expression = _build_llm_expression(challenge)
     if preferred:
         solver = solvers.get(preferred)
         if solver:
-            answer, error = solver(challenge)
-            if answer:
-                return answer, preferred, None
-            return None, preferred, error or "LLM failed"
-        return None, preferred, "preferred provider not supported"
+            llm_answer, llm_error = solver(challenge)
+            local_answer = _solve_local_math(challenge)
+            details = {
+                "llm": llm_answer,
+                "local": local_answer,
+                "llm_provider": preferred,
+                "expression": expression,
+            }
+            if llm_answer and local_answer and llm_answer != local_answer:
+                return local_answer, "local", f"LLM mismatch ({llm_answer})", details
+            if llm_answer:
+                return llm_answer, preferred, None, details
+            if local_answer:
+                return local_answer, "local", None, details
+            return None, preferred, llm_error or "LLM failed", details
+        return None, preferred, "preferred provider not supported", {
+            "llm": None,
+            "local": None,
+            "llm_provider": preferred,
+            "expression": expression,
+        }
 
     local_answer = _solve_local_math(challenge)
     if local_answer:
-        return local_answer, "local", None
+        return local_answer, "local", None, {
+            "llm": None,
+            "local": local_answer,
+            "llm_provider": None,
+            "expression": expression,
+        }
     for name in LLM_PROVIDERS:
         solver = solvers.get(name)
         if not solver:
             continue
         answer, error = solver(challenge)
         if answer:
-            return answer, name, None
-    return None, None, "unable to solve challenge"
+            return answer, name, None, {
+                "llm": answer,
+                "local": local_answer,
+                "llm_provider": name,
+                "expression": expression,
+            }
+    return None, None, "unable to solve challenge", {
+        "llm": None,
+        "local": local_answer,
+        "llm_provider": None,
+        "expression": expression,
+    }
 
 
 def _request(method, url, api_key=None, json_body=None):
@@ -842,9 +971,20 @@ def _auto_verify(base_url, api_key, data):
     if not code or not challenge:
         return False, "verification required but missing code or challenge"
     print(f"Verification challenge: {challenge}")
-    answer, provider, error = _solve_math_challenge(challenge)
+    answer, provider, error, details = _solve_math_challenge(challenge)
+    llm_answer = (details or {}).get("llm")
+    local_answer = (details or {}).get("local")
+    llm_provider = (details or {}).get("llm_provider") or provider
+    expression = (details or {}).get("expression")
+    if expression:
+        print(f"Verification expression: {expression}")
+    if llm_answer and local_answer and llm_answer != local_answer:
+        print(f"Verification LLM answer ({llm_provider}): {llm_answer}")
+        print(f"Verification local answer: {local_answer}")
+        print("Using local answer to avoid incorrect verification.")
     if not answer:
         return False, error or "unable to solve verification challenge"
+    answer = _format_answer(answer)
     provider_label = provider or "solver"
     print(f"Verification answer ({provider_label}): {answer}")
     payload = {"verification_code": code, "answer": answer}

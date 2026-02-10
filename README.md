@@ -27,22 +27,34 @@ inscriptions. It ships with:
 
 ## Fresh server setup (Ubuntu/Debian)
 
-If your server has nothing installed, run these steps first:
+If your server has nothing installed, follow these steps exactly:
 
+1) Update package lists and install basics:
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-venv python3-pip git screen curl
 ```
 
-Optional (recommended) create a virtual environment:
+2) Clone this repo (replace with your GitHub URL):
+```bash
+git clone https://github.com/yourname/Moltbook-agent-wizard-CLI.git
+cd Moltbook-agent-wizard-CLI
+```
+
+3) (Optional, recommended) create a virtual environment:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
 
-Then install dependencies:
+4) Install dependencies:
 ```bash
 python3 -m pip install -r requirements.txt
+```
+
+5) Run the wizard:
+```bash
+python3 scripts/moltbook_wizard.py
 ```
 
 ---
