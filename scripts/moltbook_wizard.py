@@ -69,6 +69,35 @@ _SCALE_NUMBERS = {
     "million": 1000000,
 }
 _NUMBER_WORDS = set(_SMALL_NUMBERS) | set(_TENS_NUMBERS)
+def _build_number_variants():
+    variants = {}
+
+    def add(value, text):
+        key = re.sub(r"[^a-z]", "", text.lower())
+        if not key:
+            return
+        variants.setdefault(key, value)
+
+    for word, value in _SMALL_NUMBERS.items():
+        if 1 <= value <= 19:
+            add(value, word)
+    for word, value in _TENS_NUMBERS.items():
+        add(value, word)
+    for tens_word, tens_value in _TENS_NUMBERS.items():
+        for ones_word, ones_value in _SMALL_NUMBERS.items():
+            if ones_value == 0:
+                continue
+            value = tens_value + ones_value
+            add(value, f"{tens_word}{ones_word}")
+            add(value, f"{tens_word}-{ones_word}")
+            add(value, f"{tens_word} {ones_word}")
+    add(100, "hundred")
+    add(100, "one hundred")
+    add(100, "one-hundred")
+    add(100, "onehundred")
+    return variants
+
+_NUMBER_VARIANTS = _build_number_variants()
 _OP_WORDS = {
     "plus": "+",
     "add": "+",
@@ -157,7 +186,7 @@ _TIME_UNITS = {
     "year",
     "years",
 }
-_DURATION_HINTS = {"for", "during", "over", "in", "travel", "traveled", "travelled", "distance", "moved"}
+_DURATION_HINTS = {"for", "during", "over", "travel", "traveled", "travelled", "distance", "moved"}
 _COUNT_REPEAT_HINTS = {
     "touches",
     "hits",
@@ -422,19 +451,45 @@ def _merge_numeric_fragments(tokens):
         token = tokens[i]
         if token.isalpha():
             norm = _normalize_word(token)
-            matched = False
             max_span = min(6, len(tokens) - i)
-            for span in range(max_span, 1, -1):
+            if len(token) <= 2:
+                max_span = min(12, len(tokens) - i)
+            best_word = None
+            best_span = None
+            best_dist = None
+            for span in range(2, max_span + 1):
                 if not all(tokens[i + j].isalpha() for j in range(span)):
                     continue
                 combined = "".join(_normalize_word(tokens[i + j]) for j in range(span))
-                combined = _normalize_number_token(combined)
-                if combined in _NUMBER_WORDS or combined in _SCALE_NUMBERS or combined == "and":
-                    merged.append(combined)
-                    i += span
-                    matched = True
-                    break
-            if matched:
+                strict = _strict_number_word(combined)
+                if strict:
+                    if best_word is None or best_dist is None or 0 < best_dist or span < best_span:
+                        best_word = strict
+                        best_span = span
+                        best_dist = 0
+            if best_word is None:
+                for span in range(2, max_span + 1):
+                    if not all(tokens[i + j].isalpha() for j in range(span)):
+                        continue
+                    combined = "".join(_normalize_word(tokens[i + j]) for j in range(span))
+                    candidate = _normalize_number_token(combined)
+                    if (
+                        candidate not in _NUMBER_WORDS
+                        and candidate not in _SCALE_NUMBERS
+                        and candidate not in _NUMBER_VARIANTS
+                        and candidate != "and"
+                    ):
+                        continue
+                    dist = _edit_distance_limited(re.sub(r"(.)\1+", r"\1", combined), candidate, 2)
+                    if dist is None:
+                        dist = 2
+                    if best_word is None or dist < best_dist or (dist == best_dist and span < best_span):
+                        best_word = candidate
+                        best_span = span
+                        best_dist = dist
+            if best_word:
+                merged.append(best_word)
+                i += best_span
                 continue
             merged.append(_normalize_number_token(norm))
         else:
@@ -471,6 +526,12 @@ def _has_any_word(cleaned, words):
 def _has_duration_hint(cleaned, compact, compact_norm):
     if _has_any_word(cleaned, _DURATION_HINTS):
         return True
+    if cleaned:
+        number_words = "|".join(sorted(_NUMBER_WORDS | set(_SCALE_NUMBERS)))
+        time_words = "|".join(sorted(_TIME_UNITS))
+        pattern = rf"\bin\s+(?:\d+|{number_words})(?:\s+(?:{number_words}))?\s+(?:{time_words})\b"
+        if re.search(pattern, cleaned):
+            return True
     if not compact:
         return False
     for hint in _DURATION_HINTS:
@@ -948,14 +1009,11 @@ def _normalize_number_token(token):
         return token
     if token.isalpha():
         token = token.lower()
-        if token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and":
-            return token
+        strict = _strict_number_word(token)
+        if strict:
+            return strict
         softened = _normalize_word(token)
-        if softened in _NUMBER_WORDS or softened in _SCALE_NUMBERS or softened == "and":
-            return softened
         collapsed = re.sub(r"(.)\1+", r"\1", softened)
-        if collapsed in _NUMBER_WORDS or collapsed in _SCALE_NUMBERS or collapsed == "and":
-            return collapsed
         fixed = _fix_number_word(collapsed)
         if fixed in _NUMBER_WORDS or fixed in _SCALE_NUMBERS or fixed == "and":
             return fixed
@@ -964,6 +1022,25 @@ def _normalize_number_token(token):
             return fixed
         return collapsed
     return token
+
+
+def _strict_number_word(token):
+    token = token.lower()
+    if token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and":
+        return token
+    if token in _NUMBER_VARIANTS:
+        return token
+    softened = _normalize_word(token)
+    if softened in _NUMBER_WORDS or softened in _SCALE_NUMBERS or softened == "and":
+        return softened
+    if softened in _NUMBER_VARIANTS:
+        return softened
+    collapsed = re.sub(r"(.)\1+", r"\1", softened)
+    if collapsed in _NUMBER_WORDS or collapsed in _SCALE_NUMBERS or collapsed == "and":
+        return collapsed
+    if collapsed in _NUMBER_VARIANTS:
+        return collapsed
+    return None
 
 
 def _fix_number_word(token):
@@ -982,6 +1059,9 @@ def _fix_number_word(token):
                 if len(word) == len(token) + 1 and word[0] == token[0]:
                     if _is_subsequence(token, word):
                         return word
+    fuzzy = _fuzzy_number_word(token)
+    if fuzzy:
+        return fuzzy
     return token
 
 
@@ -991,6 +1071,46 @@ def _is_subsequence(shorter, longer):
         if idx < len(shorter) and shorter[idx] == ch:
             idx += 1
     return idx == len(shorter)
+
+
+def _edit_distance_limited(a, b, max_dist):
+    if abs(len(a) - len(b)) > max_dist:
+        return None
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        row_min = curr[0]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            curr.append(min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost))
+            row_min = min(row_min, curr[-1])
+        if row_min > max_dist:
+            return None
+        prev = curr
+    dist = prev[-1]
+    if dist > max_dist:
+        return None
+    return dist
+
+
+def _fuzzy_number_word(token):
+    if not token or len(token) < 4:
+        return None
+    best = None
+    best_dist = None
+    for word in (_NUMBER_WORDS | set(_SCALE_NUMBERS)):
+        if token[0] != word[0]:
+            continue
+        if abs(len(token) - len(word)) > 2:
+            continue
+        max_dist = 1 if len(word) <= 5 else 2
+        dist = _edit_distance_limited(token, word, max_dist)
+        if dist is None:
+            continue
+        if best_dist is None or dist < best_dist:
+            best = word
+            best_dist = dist
+    return best
 
 
 def _format_expr_number(value):
@@ -1060,19 +1180,40 @@ def _build_llm_expression(challenge):
 def _words_to_number(words):
     total = 0
     current = 0
+    has_tens = False
     for word in words:
         if word == "and":
             continue
+        if word in _NUMBER_VARIANTS:
+            value = _NUMBER_VARIANTS[word]
+            if value == 100:
+                current = max(1, current) * 100 if current else 100
+                has_tens = False
+                continue
+            if value >= 10 and has_tens:
+                continue
+            current += value
+            if value >= 20:
+                has_tens = True
+            continue
         if word in _SMALL_NUMBERS:
-            current += _SMALL_NUMBERS[word]
+            value = _SMALL_NUMBERS[word]
+            if value >= 10 and has_tens:
+                continue
+            current += value
         elif word in _TENS_NUMBERS:
+            if has_tens:
+                continue
             current += _TENS_NUMBERS[word]
+            has_tens = True
         elif word == "hundred":
             current = max(1, current) * _SCALE_NUMBERS[word]
+            has_tens = False
         elif word in ("thousand", "million"):
             scale = _SCALE_NUMBERS[word]
             total += max(1, current) * scale
             current = 0
+            has_tens = False
     return total + current
 
 
@@ -1081,7 +1222,7 @@ def _is_number_token(token):
         return True
     if token and token.isalpha():
         token = _normalize_number_token(token)
-        return token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and"
+        return token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token in _NUMBER_VARIANTS or token == "and"
     return False
 
 
@@ -1131,20 +1272,26 @@ def _challenge_to_expr(challenge):
             continue
         if token.isalpha():
             token = _normalize_number_token(token)
-        if token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token == "and":
+        if token in _NUMBER_WORDS or token in _SCALE_NUMBERS or token in _NUMBER_VARIANTS or token == "and":
             words = []
             j = i
             while j < len(tokens):
                 nxt = tokens[j]
                 if nxt.isalpha():
                     nxt = _normalize_number_token(nxt)
-                if nxt in _NUMBER_WORDS or nxt in _SCALE_NUMBERS or nxt == "and":
+                if nxt in _NUMBER_WORDS or nxt in _SCALE_NUMBERS or nxt in _NUMBER_VARIANTS or nxt == "and":
                     words.append(nxt)
                     j += 1
                     continue
                 break
             words = _collapse_duplicate_number_words(words)
-            has_numeric = any(word in _SMALL_NUMBERS or word in _TENS_NUMBERS or word in _SCALE_NUMBERS for word in words)
+            has_numeric = any(
+                word in _SMALL_NUMBERS
+                or word in _TENS_NUMBERS
+                or word in _SCALE_NUMBERS
+                or word in _NUMBER_VARIANTS
+                for word in words
+            )
             if has_numeric:
                 value = _words_to_number(words)
                 out.append(str(value))
@@ -1169,6 +1316,16 @@ def _challenge_to_expr(challenge):
             i += 1
             continue
         i += 1
+    cleaned, compact, compact_norm = _prepare_hint_text(challenge)
+    if _has_hint(_RATE_UNITS, cleaned, compact, compact_norm) and not _has_hint(
+        _DIVIDE_HINTS, cleaned, compact, compact_norm
+    ):
+        out = [tok for tok in out if tok != "/"]
+    if _has_hint(_SUM_HINTS, cleaned, compact, compact_norm) and not _has_hint(
+        _SUBTRACT_HINTS, cleaned, compact, compact_norm
+    ):
+        out = [tok for tok in out if tok != "-"]
+    has_operator = any(tok in "+-*/" for tok in out)
     explicit_expr = _extract_explicit_expr(out)
     if explicit_expr:
         return explicit_expr, numbers, True
