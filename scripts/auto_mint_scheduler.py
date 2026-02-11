@@ -13,6 +13,7 @@ DEFAULT_BASE_URL = "https://www.moltbook.com/api/v1"
 PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".config", "moltbook-wizard")
 PROFILES_PATH = os.path.join(PROFILE_DIR, "profiles.json")
 DEFAULT_STATE_PATH = os.path.join(PROFILE_DIR, "auto_mint_state.json")
+CONTENT_ID_LOG_PATH = os.path.join(PROFILE_DIR, "content_ids.log")
 LLM_CONFIG_PATH = os.path.join(PROFILE_DIR, "llm_config.json")
 OPENROUTER_CONFIG_PATH = os.path.join(PROFILE_DIR, "openrouter.json")
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -137,6 +138,18 @@ _SUBTRACT_HINTS = {
     "decrease",
     "decreases",
     "reduced",
+    "reduce",
+    "reduces",
+    "drop",
+    "drops",
+    "dropped",
+    "slow",
+    "slows",
+    "slowed",
+    "slowing",
+    "decelerate",
+    "decelerates",
+    "decelerated",
 }
 _MULTIPLY_HINTS = {
     "product",
@@ -229,6 +242,19 @@ def _save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
     os.chmod(path, 0o600)
+
+
+def _record_content_id(content_id, label=None, content_type=None):
+    if not content_id:
+        return
+    timestamp = _utc_now().isoformat()
+    link = f"https://www.moltbook.com/post/{content_id}"
+    label = label or "unknown"
+    content_type = content_type or "post"
+    line = f"{timestamp} | {label} | {content_type} | {content_id} | {link}\n"
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    with open(CONTENT_ID_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(line)
 
 
 def _load_llm_config():
@@ -358,38 +384,36 @@ def _merge_numeric_fragments(tokens):
             best_word = None
             best_span = None
             best_dist = None
-            # Prefer strict matches first.
             for span in range(2, max_span + 1):
                 if not all(tokens[i + j].isalpha() for j in range(span)):
                     continue
-                combined = "".join(_normalize_word(tokens[i + j]) for j in range(span))
+                span_tokens = tokens[i : i + span]
+                all_short = all(len(t) <= 2 for t in span_tokens)
+                combined = "".join(_normalize_word(t) for t in span_tokens)
                 strict = _strict_number_word(combined)
                 if strict:
                     if best_word is None or best_dist is None or 0 < best_dist or span < best_span:
                         best_word = strict
                         best_span = span
                         best_dist = 0
-            # If no strict match, allow fuzzy match with distance scoring.
-            if best_word is None:
-                for span in range(2, max_span + 1):
-                    if not all(tokens[i + j].isalpha() for j in range(span)):
-                        continue
-                    combined = "".join(_normalize_word(tokens[i + j]) for j in range(span))
-                    candidate = _normalize_number_token(combined)
-                    if (
-                        candidate not in _NUMBER_WORDS
-                        and candidate not in _SCALE_NUMBERS
-                        and candidate not in _NUMBER_VARIANTS
-                        and candidate != "and"
-                    ):
-                        continue
-                    dist = _edit_distance_limited(re.sub(r"(.)\1+", r"\1", combined), candidate, 2)
-                    if dist is None:
-                        dist = 2
-                    if best_word is None or dist < best_dist or (dist == best_dist and span < best_span):
-                        best_word = candidate
-                        best_span = span
-                        best_dist = dist
+                    continue
+                if not all_short:
+                    continue
+                candidate = _normalize_number_token(combined)
+                if (
+                    candidate not in _NUMBER_WORDS
+                    and candidate not in _SCALE_NUMBERS
+                    and candidate not in _NUMBER_VARIANTS
+                    and candidate != "and"
+                ):
+                    continue
+                dist = _edit_distance_limited(re.sub(r"(.)\1+", r"\1", combined), candidate, 2)
+                if dist is None:
+                    dist = 2
+                if best_word is None or dist < best_dist or (dist == best_dist and span < best_span):
+                    best_word = candidate
+                    best_span = span
+                    best_dist = dist
             if best_word:
                 merged.append(best_word)
                 i += best_span
@@ -1026,6 +1050,10 @@ def _challenge_to_expr(challenge):
     ):
         out = [tok for tok in out if tok != "/"]
     if _has_hint(_SUM_HINTS, cleaned, compact, compact_norm) and not _has_hint(
+        _DIVIDE_HINTS, cleaned, compact, compact_norm
+    ):
+        out = [tok for tok in out if tok != "/"]
+    if _has_hint(_SUM_HINTS, cleaned, compact, compact_norm) and not _has_hint(
         _SUBTRACT_HINTS, cleaned, compact, compact_norm
     ):
         out = [tok for tok in out if tok != "-"]
@@ -1408,7 +1436,22 @@ def _post_mint(base_url, api_key, tick, amount, submolt, prefix, dry_run):
     return _request("POST", f"{base_url}/posts", api_key=api_key, json_body=body)
 
 
-def _auto_verify(base_url, api_key, data):
+def _content_id_from_error(error_text):
+    if not error_text:
+        return None
+    payload = error_text
+    if "HTTP" in error_text and ":" in error_text:
+        payload = error_text.split(":", 1)[1].strip()
+    try:
+        data = json.loads(payload)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict):
+        return data.get("content_id") or data.get("post_id")
+    return None
+
+
+def _auto_verify(base_url, api_key, data, label):
     post = data.get("post") or data.get("data") or {}
     verification_required = data.get("verification_required") or post.get("verification_status") == "pending"
     if not verification_required:
@@ -1438,7 +1481,15 @@ def _auto_verify(base_url, api_key, data):
     payload = {"verification_code": code, "answer": answer}
     verify_data, error = _request("POST", f"{base_url}/verify", api_key=api_key, json_body=payload)
     if not verify_data:
+        content_id = _content_id_from_error(error)
+        if content_id:
+            print(f"\"content_id\": \"{content_id}\"")
+            _record_content_id(content_id, label=label, content_type="post")
         return False, error
+    content_id = verify_data.get("content_id")
+    if content_id:
+        print(f"\"content_id\": \"{content_id}\"")
+        _record_content_id(content_id, label=label, content_type=verify_data.get("content_type"))
     return True, None
 
 
@@ -1576,7 +1627,7 @@ def _run_once(base_url, profiles, state, args):
         post = data.get("post") or data.get("data") or {}
         post_id = post.get("id")
         post_time = _parse_iso(post.get("created_at")) or _utc_now()
-        verified, verify_error = _auto_verify(base_url, api_key, data)
+        verified, verify_error = _auto_verify(base_url, api_key, data, name)
         if verified:
             print(f"[{name}] posted (id={post_id})")
             _record_post(state, name, signature, "posted", post_id=post_id, post_time=post_time)
@@ -1606,7 +1657,7 @@ def main():
     parser.add_argument("--amount", required=True, help="mint amount")
     parser.add_argument("--submolt", default="mbc20")
     parser.add_argument("--prefix", default="mbc20.xyz")
-    parser.add_argument("--interval-minutes", type=int, default=120)
+    parser.add_argument("--interval-minutes", type=int, default=30)
     parser.add_argument("--profiles", default=PROFILES_PATH, help="profiles.json path")
     parser.add_argument("--state", default=DEFAULT_STATE_PATH, help="state file path")
     parser.add_argument("--only", help="comma-separated profile names to include")

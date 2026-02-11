@@ -70,7 +70,7 @@ def main():
     parser.add_argument("--api-key", help="Moltbook API key")
     parser.add_argument("--profile", help="profile name from wizard")
     parser.add_argument("--profiles", default=PROFILES_PATH, help="profiles.json path")
-    parser.add_argument("--interval-minutes", type=int, default=120)
+    parser.add_argument("--interval-minutes", type=int, default=30)
     args = parser.parse_args()
 
     api_key = args.api_key or os.getenv("MOLTBOOK_API_KEY")
