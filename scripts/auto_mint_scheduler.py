@@ -14,6 +14,7 @@ PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".config", "moltbook-wizard"
 PROFILES_PATH = os.path.join(PROFILE_DIR, "profiles.json")
 DEFAULT_STATE_PATH = os.path.join(PROFILE_DIR, "auto_mint_state.json")
 CONTENT_ID_LOG_PATH = os.path.join(PROFILE_DIR, "content_ids.log")
+MBC20_INDEX_URL = "https://mbc20.xyz/api/index-post"
 LLM_CONFIG_PATH = os.path.join(PROFILE_DIR, "llm_config.json")
 OPENROUTER_CONFIG_PATH = os.path.join(PROFILE_DIR, "openrouter.json")
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -255,6 +256,26 @@ def _record_content_id(content_id, label=None, content_type=None):
     os.makedirs(PROFILE_DIR, exist_ok=True)
     with open(CONTENT_ID_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(line)
+    _trigger_missing_mint(content_id)
+
+
+def _trigger_missing_mint(content_id):
+    if not content_id:
+        return
+    try:
+        resp = requests.get(MBC20_INDEX_URL, params={"id": content_id}, timeout=20)
+    except requests.RequestException as exc:
+        print(f"Missing mint request failed: {exc}")
+        return
+    if resp.status_code not in (200, 201):
+        print(f"Missing mint HTTP {resp.status_code}: {resp.text}")
+        return
+    try:
+        data = resp.json()
+    except ValueError:
+        print("Missing mint response was not JSON")
+        return
+    print(f"Missing mint response: {json.dumps(data, sort_keys=True)}")
 
 
 def _load_llm_config():
