@@ -1830,6 +1830,60 @@ def _format_number(value):
     return f"{num:,.2f}"
 
 
+def _parse_compact_number(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    multiplier = 1
+    suffix = text[-1].upper()
+    if suffix in ("K", "M", "B"):
+        text = text[:-1].strip()
+        multiplier = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}[suffix]
+    text = text.replace(",", "").replace("+", "")
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        return None
+
+
+def _extract_holdings_html(html_text):
+    if not html_text:
+        return None
+    lower = html_text.lower()
+    start = lower.find(">holdings<")
+    if start == -1:
+        return None
+    end = lower.find(">recent activity<", start)
+    section = html_text[start : end if end != -1 else None]
+    pattern = re.compile(
+        r'href="/tokens/([^"]+)".*?text-success\">([^<]+)</span>',
+        re.DOTALL,
+    )
+    holdings = {}
+    for match in pattern.finditer(section):
+        tick = match.group(1).strip().upper()
+        amount_text = match.group(2).strip()
+        amount_num = _parse_compact_number(amount_text)
+        holdings[tick] = amount_num if amount_num is not None else amount_text
+    return holdings or None
+
+
+def _fetch_agent_holdings(agent_name):
+    url = f"https://mbc20.xyz/agents/{agent_name}"
+    try:
+        resp = requests.get(url, timeout=30)
+    except requests.RequestException as exc:
+        return None, f"request failed: {exc}"
+    if resp.status_code not in (200, 201):
+        return None, f"HTTP {resp.status_code}: {resp.text}"
+    holdings = _extract_holdings_html(resp.text)
+    if not holdings:
+        return None, "no holdings found in page"
+    return holdings, None
+
+
 def _cmd_tokens():
     _print_header("MBC-20 tokens (mbc20.xyz)")
     last_error = None
@@ -1906,7 +1960,7 @@ def _parse_mbc20_mint(content):
 
 
 def _cmd_my_mints(base_url, state):
-    _print_header("MBC-20 mints (recent)")
+    _print_header("MBC-20 holdings (mbc20.xyz)")
     profiles_data = _load_profiles()
     profiles_map = profiles_data.get("profiles", {})
     active = profiles_data.get("active")
@@ -1963,77 +2017,43 @@ def _cmd_my_mints(base_url, state):
         print("No valid agent profiles found.")
         return
 
-    posts_data = _request(
-        "GET",
-        f"{base_url}/posts?submolt=mbc20&sort=new&limit=100",
-        api_key=request_key,
-    )
-    if not posts_data:
-        return
-    posts = _extract_posts(posts_data)
-    if not posts:
-        print("No posts found.")
-        return
-
-    results = []
-    for post in posts:
-        author = post.get("author", {}) or {}
-        author_name = author.get("name")
-        if author_name not in agent_names:
+    holdings_by_agent = {}
+    totals = {}
+    for agent_name in sorted(agent_names.keys()):
+        holdings, error = _fetch_agent_holdings(agent_name)
+        if not holdings:
+            print(f"[{agent_name}] unable to fetch holdings: {error}")
             continue
-        mint_info = _parse_mbc20_mint(post.get("content", ""))
-        if not mint_info:
-            continue
-        url = post.get("url") or ""
-        if url.startswith("/"):
-            url = f"https://www.moltbook.com{url}"
-        results.append(
-            {
-                "agent": author_name,
-                "profile": agent_names.get(author_name),
-                "tick": mint_info.get("tick"),
-                "amt": mint_info.get("amt"),
-                "created_at": post.get("created_at"),
-                "url": url,
-                "verification_status": post.get("verification_status"),
-                "post_id": post.get("id"),
-            }
-        )
+        holdings_by_agent[agent_name] = holdings
+        for tick, amount in holdings.items():
+            amount_num = amount if isinstance(amount, (int, float)) else _parse_compact_number(amount)
+            if amount_num is None:
+                continue
+            totals[tick] = totals.get(tick, 0) + amount_num
 
-    if not results:
+    if not holdings_by_agent:
         names = ", ".join(sorted(agent_names.keys()))
-        print(f"No mint posts found in the last 100 MBC-20 posts for: {names}")
-        print("Tip: if you minted earlier, try again later or use the mbc20.xyz agent search.")
+        print(f"No holdings found for: {names}")
+        print("Tip: try https://mbc20.xyz/agents/<agent> in a browser to confirm.")
         return
 
-    names = ", ".join(sorted(agent_names.keys()))
-    print(f"Found {len(results)} mint post(s) for {names}.")
-    print("Available mint IDs:")
-    for item in results:
-        post_id = item.get("post_id") or "unknown"
-        tick = item.get("tick") or "?"
-        created = item.get("created_at") or ""
-        agent = item.get("agent") or "?"
-        print(f"- {post_id} | {agent} | {tick} | {created}")
-    selection = _prompt("Show which ID? (type 'all' for everything)", default="all", required=False)
-    selection = (selection or "all").strip()
-    if selection.lower() != "all":
-        filtered = [item for item in results if item.get("post_id") == selection]
-        if not filtered:
-            print("No mint found with that ID.")
-            return
-        results = filtered
+    for agent_name, holdings in holdings_by_agent.items():
+        print(f"Agent: {agent_name}")
+        print("tick | amount")
+        print("-" * 24)
+        for tick in sorted(holdings.keys()):
+            amount = holdings[tick]
+            amount_num = amount if isinstance(amount, (int, float)) else _parse_compact_number(amount)
+            display = _format_number(amount_num) if amount_num is not None else str(amount)
+            print(f"{tick} | {display}")
+        print("")
 
-    print("agent | tick | amount | created_at | url | status")
-    print("-" * 96)
-    for item in results:
-        agent = item.get("agent") or "?"
-        tick = item.get("tick") or "?"
-        amt = item.get("amt") or "?"
-        created = item.get("created_at") or ""
-        url = item.get("url") or ""
-        status = item.get("verification_status") or "published"
-        print(f"{agent} | {tick} | {amt} | {created} | {url} | {status}")
+    if totals:
+        print("Total across selected agents")
+        print("tick | amount")
+        print("-" * 24)
+        for tick in sorted(totals.keys()):
+            print(f"{tick} | {_format_number(totals[tick])}")
 
 
 def _set_llm_provider(provider, label, default_model, test_func):
