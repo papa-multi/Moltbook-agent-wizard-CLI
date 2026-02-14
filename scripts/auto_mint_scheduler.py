@@ -4,17 +4,23 @@ import ast
 import json
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 
 import requests
 
 DEFAULT_BASE_URL = "https://www.moltbook.com/api/v1"
+DEFAULT_MBC20_INDEX_URL = "https://mbc20.xyz/api/index-post"
+DEFAULT_MISSING_MINT_RETRY_MINUTES = 60
+DEFAULT_MISSING_MINT_TRANSIENT_RETRY_MINUTES = 3
+DEFAULT_MISSING_MINT_CHECK_MINUTES = 3
+DEFAULT_MISSING_MINT_INITIAL_DELAY_MINUTES = 3
 PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".config", "moltbook-wizard")
 PROFILES_PATH = os.path.join(PROFILE_DIR, "profiles.json")
 DEFAULT_STATE_PATH = os.path.join(PROFILE_DIR, "auto_mint_state.json")
 CONTENT_ID_LOG_PATH = os.path.join(PROFILE_DIR, "content_ids.log")
-MBC20_INDEX_URL = "https://mbc20.xyz/api/index-post"
+MISSING_MINT_QUEUE_PATH = os.path.join(PROFILE_DIR, "missing_mint_queue.json")
 LLM_CONFIG_PATH = os.path.join(PROFILE_DIR, "llm_config.json")
 OPENROUTER_CONFIG_PATH = os.path.join(PROFILE_DIR, "openrouter.json")
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -64,6 +70,21 @@ _SCALE_NUMBERS = {
     "million": 1000000,
 }
 _NUMBER_WORDS = set(_SMALL_NUMBERS) | set(_TENS_NUMBERS)
+_ADJACENT_UNITS = (
+    "cm",
+    "m",
+    "meter",
+    "meters",
+    "metre",
+    "metres",
+    "s",
+    "sec",
+    "second",
+    "seconds",
+    "n",
+    "newton",
+    "newtons",
+)
 def _build_number_variants():
     variants = {}
 
@@ -144,6 +165,11 @@ _SUBTRACT_HINTS = {
     "drop",
     "drops",
     "dropped",
+    "lose",
+    "loses",
+    "lost",
+    "losing",
+    "loss",
     "slow",
     "slows",
     "slowed",
@@ -245,6 +271,203 @@ def _save_json(path, data):
     os.chmod(path, 0o600)
 
 
+def _get_mbc20_index_url():
+    return os.getenv("MBC20_INDEX_URL", DEFAULT_MBC20_INDEX_URL)
+
+
+def _index_timeout_sec():
+    try:
+        return max(1.0, float(os.getenv("MBC20_INDEX_TIMEOUT_SEC", "20")))
+    except ValueError:
+        return 20.0
+
+
+def _index_attempts():
+    try:
+        return max(1, int(os.getenv("MBC20_INDEX_ATTEMPTS", "3")))
+    except ValueError:
+        return 3
+
+
+def _index_retry_delay_sec():
+    try:
+        return max(0.0, float(os.getenv("MBC20_INDEX_RETRY_DELAY_SEC", "2")))
+    except ValueError:
+        return 2.0
+
+
+def _missing_mint_retry_minutes():
+    try:
+        return max(1, int(os.getenv("MBC20_MISSING_MINT_RETRY_MINUTES", str(DEFAULT_MISSING_MINT_RETRY_MINUTES))))
+    except ValueError:
+        return DEFAULT_MISSING_MINT_RETRY_MINUTES
+
+
+def _missing_mint_transient_retry_minutes():
+    try:
+        return max(1, int(os.getenv("MBC20_MISSING_MINT_TRANSIENT_RETRY_MINUTES", str(DEFAULT_MISSING_MINT_TRANSIENT_RETRY_MINUTES))))
+    except ValueError:
+        return DEFAULT_MISSING_MINT_TRANSIENT_RETRY_MINUTES
+
+
+def _missing_mint_check_minutes():
+    try:
+        return max(1, int(os.getenv("MBC20_MISSING_MINT_CHECK_MINUTES", str(DEFAULT_MISSING_MINT_CHECK_MINUTES))))
+    except ValueError:
+        return DEFAULT_MISSING_MINT_CHECK_MINUTES
+
+
+def _missing_mint_initial_delay_minutes():
+    try:
+        return max(1, int(os.getenv("MBC20_MISSING_MINT_INITIAL_DELAY_MINUTES", str(DEFAULT_MISSING_MINT_INITIAL_DELAY_MINUTES))))
+    except ValueError:
+        return DEFAULT_MISSING_MINT_INITIAL_DELAY_MINUTES
+
+
+def _load_missing_mint_queue():
+    return _load_json(MISSING_MINT_QUEUE_PATH, [])
+
+
+def _save_missing_mint_queue(queue):
+    _save_json(MISSING_MINT_QUEUE_PATH, queue[-200:])
+
+
+def _enqueue_missing_mint(content_id, reason, delay_minutes=10):
+    if not content_id:
+        return None
+    queue = _load_missing_mint_queue()
+    now = _utc_now()
+    next_at = now + timedelta(minutes=delay_minutes)
+    for entry in queue:
+        if entry.get("content_id") == content_id:
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            entry["last_error"] = str(reason)[:200] if reason else entry.get("last_error")
+            existing_next = _parse_iso(entry.get("next_attempt_at")) or next_at
+            if next_at < existing_next:
+                entry["next_attempt_at"] = next_at.isoformat()
+            _save_missing_mint_queue(queue)
+            return entry.get("next_attempt_at")
+    entry = {
+        "content_id": content_id,
+        "attempts": 1,
+        "created_at": now.isoformat(),
+        "next_attempt_at": next_at.isoformat(),
+        "last_error": str(reason)[:200] if reason else None
+    }
+    queue.append(entry)
+    _save_missing_mint_queue(queue)
+    return entry["next_attempt_at"]
+
+
+def _curl_index_post(url, content_id):
+    timeout = _index_timeout_sec()
+    cmd = [
+        "curl",
+        "-sS",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "2",
+        "--retry-all-errors",
+        "--max-time",
+        str(int(timeout)),
+        "-H",
+        "accept: application/json, text/plain, */*",
+        "-H",
+        "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        f"{url}?id={content_id}",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Missing mint curl failed: {exc}")
+        return None
+    if result.returncode != 0:
+        print(f"Missing mint curl error: {result.stderr.strip()}")
+        return None
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        print(f"Missing mint curl response was not JSON: {result.stdout[:200]}")
+        return None
+
+
+def _request_missing_mint(content_id):
+    url = _get_mbc20_index_url()
+    timeout = _index_timeout_sec()
+    attempts = _index_attempts()
+    delay_base = _index_retry_delay_sec()
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "referer": "https://mbc20.xyz/tokens/GPT",
+    }
+    resp = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(url, params={"id": content_id}, headers=headers, timeout=timeout)
+        except requests.RequestException as exc:
+            print(f"Missing mint request failed (attempt {attempt}): {exc}")
+            resp = None
+        if resp is None:
+            time.sleep(delay_base * attempt)
+            continue
+        if resp.status_code in (200, 201):
+            try:
+                return resp.json(), resp.status_code, None
+            except ValueError:
+                return None, resp.status_code, "response was not JSON"
+        if resp.status_code >= 500:
+            time.sleep(delay_base * attempt)
+            continue
+        break
+    if resp is not None:
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if data:
+            return None, resp.status_code, data.get("error") or resp.text
+        return None, resp.status_code, resp.text
+
+    data = _curl_index_post(url, content_id)
+    if data:
+        return data, 200, None
+    return None, None, "curl_failed"
+
+
+def _process_missing_mint_queue(max_items=3):
+    queue = _load_missing_mint_queue()
+    if not queue:
+        return
+    now = _utc_now()
+    new_queue = []
+    processed = 0
+    for entry in queue:
+        if processed >= max_items:
+            new_queue.append(entry)
+            continue
+        next_at = _parse_iso(entry.get("next_attempt_at")) or now
+        if next_at > now:
+            new_queue.append(entry)
+            continue
+        content_id = entry.get("content_id")
+        data, status, error = _request_missing_mint(content_id)
+        if data:
+            print(f"Missing mint retry success: {json.dumps(data, sort_keys=True)}")
+        else:
+            attempts = entry.get("attempts", 0) + 1
+            delay = _missing_mint_retry_minutes() if status == 404 or (error and "Post not found" in error) else _missing_mint_transient_retry_minutes()
+            entry.update({
+                "attempts": attempts,
+                "next_attempt_at": (now + timedelta(minutes=delay)).isoformat(),
+                "last_error": str(error)[:200] if error else f"HTTP {status}"
+            })
+            new_queue.append(entry)
+        processed += 1
+    _save_missing_mint_queue(new_queue)
+
+
 def _record_content_id(content_id, label=None, content_type=None):
     if not content_id:
         return
@@ -256,26 +479,29 @@ def _record_content_id(content_id, label=None, content_type=None):
     os.makedirs(PROFILE_DIR, exist_ok=True)
     with open(CONTENT_ID_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(line)
-    _trigger_missing_mint(content_id)
+    _trigger_missing_mint(content_id, delay_first=True)
 
 
-def _trigger_missing_mint(content_id):
+def _trigger_missing_mint(content_id, delay_first=False):
     if not content_id:
         return
-    try:
-        resp = requests.get(MBC20_INDEX_URL, params={"id": content_id}, timeout=20)
-    except requests.RequestException as exc:
-        print(f"Missing mint request failed: {exc}")
+    if delay_first:
+        next_at = _enqueue_missing_mint(content_id, "scheduled", delay_minutes=_missing_mint_initial_delay_minutes())
+        print(f"Missing mint scheduled. First attempt at {next_at}.")
         return
-    if resp.status_code not in (200, 201):
-        print(f"Missing mint HTTP {resp.status_code}: {resp.text}")
+    data, status, error = _request_missing_mint(content_id)
+    if data:
+        print(f"Missing mint response: {json.dumps(data, sort_keys=True)}")
         return
-    try:
-        data = resp.json()
-    except ValueError:
-        print("Missing mint response was not JSON")
+    if status == 404 or (error and "Post not found" in error):
+        next_at = _enqueue_missing_mint(content_id, error or "Post not found", delay_minutes=_missing_mint_retry_minutes())
+        print(f"Missing mint not indexed yet. Queued retry at {next_at}.")
         return
-    print(f"Missing mint response: {json.dumps(data, sort_keys=True)}")
+    if status is None or (status and status >= 500):
+        next_at = _enqueue_missing_mint(content_id, error or f"HTTP {status}", delay_minutes=_missing_mint_transient_retry_minutes())
+        print(f"Missing mint retry queued (transient error). Next attempt at {next_at}.")
+        return
+    print(f"Missing mint failed: {error}")
 
 
 def _load_llm_config():
@@ -988,6 +1214,57 @@ def _has_number_ahead(tokens, start):
     return False
 
 
+def _digit_has_unit(text, start, end):
+    right = ""
+    idx = end
+    while idx < len(text) and text[idx].isalpha():
+        right += text[idx]
+        idx += 1
+    left = ""
+    idx = start - 1
+    while idx >= 0 and text[idx].isalpha():
+        left = text[idx] + left
+        idx -= 1
+    for segment in (right, left):
+        if not segment:
+            continue
+        for unit in _ADJACENT_UNITS:
+            if segment.startswith(unit):
+                return True
+    return False
+
+
+def _tokenize_challenge(text):
+    tokens = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch.isalpha():
+            j = i + 1
+            while j < len(text) and text[j].isalpha():
+                j += 1
+            tokens.append(text[i:j])
+            i = j
+            continue
+        if ch.isdigit():
+            j = i + 1
+            while j < len(text) and (text[j].isdigit() or text[j] == "."):
+                j += 1
+            left_alpha = i > 0 and text[i - 1].isalpha()
+            right_alpha = j < len(text) and text[j].isalpha()
+            if left_alpha or right_alpha:
+                if _digit_has_unit(text, i, j):
+                    tokens.append(text[i:j])
+            else:
+                tokens.append(text[i:j])
+            i = j
+            continue
+        if ch in "+*/()-":
+            tokens.append(ch)
+        i += 1
+    return tokens
+
+
 def _challenge_to_expr(challenge):
     if not challenge:
         return "", [], False
@@ -996,7 +1273,7 @@ def _challenge_to_expr(challenge):
     text = re.sub(r"(?<=[a-z])[+*/-]+", " ", text)
     text = re.sub(r"[+*/-]+(?=[a-z])", " ", text)
     text = text.replace("-", " ")
-    tokens = _merge_numeric_fragments(re.findall(r"[a-z]+|\d+(?:\.\d+)?|[+*/()\-]", text))
+    tokens = _merge_numeric_fragments(_tokenize_challenge(text))
     out = []
     numbers = []
     has_operator = False
@@ -1525,6 +1802,10 @@ def _ensure_claimed(base_url, api_key):
 
 def _run_once(base_url, profiles, state, args):
     next_times = []
+    _process_missing_mint_queue()
+    check_minutes = _missing_mint_check_minutes()
+    if check_minutes:
+        next_times.append(_utc_now() + timedelta(minutes=check_minutes))
     only = None
     if args.only:
         only = {name.strip() for name in args.only.split(",") if name.strip()}
